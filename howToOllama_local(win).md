@@ -37,7 +37,6 @@ wsl -l -v
 ```text
   NAME              STATE           VERSION
 * Ubuntu            Running         2
-  docker-desktop    Running         2
 ```
 
 * `Ubuntu` 가 존재하고 `VERSION`이 `2`이면 사용 준비 완료.
