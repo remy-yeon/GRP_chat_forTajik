@@ -1,0 +1,103 @@
+body {
+    font-family: Arial, sans-serif;
+    font-size: 16px;
+
+}
+
+.container {
+    width: 70%;
+    /* height: 100%; */
+    margin: auto;
+    padding: 20px;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    box-shadow: 0 0 10px rgba(0,0,0,0.1);
+}
+
+h1 {
+    font-family: 'Noto Sans KR', sans-serif;  /* Apply font to title */
+    font-size: 3rem;
+    color: #333;
+    text-align: center;
+}
+#answer,
+#timeTaken {
+    font-family: 'Noto Sans KR', sans-serif;  /* Apply to answer section */
+    font-size: 1.2rem;
+    color: #333;
+}
+
+#spinner {
+    display: none;
+    width: 50px;
+    height: 50px;
+    border: 8px solid #f3f3f3;
+    border-top: 8px solid #3498db;
+    border-radius: 50%;
+    animation: spin 2s linear infinite;
+    margin: 20px auto; /* Center the spinner */
+}
+
+@keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
+
+
+.upload-section,
+.qa-section input,
+.answer-section {
+    margin-bottom: 20px;
+}
+
+input[type="file"] {
+    display: none; /* 파일 입력 숨김 */
+}.custom-file-upload {
+    padding: 10px 20px;
+    font-size: 1rem;
+    background-color: tomato;
+    color: white;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    margin-right: 10px;
+}
+.file-name {
+    margin-top: 10px;
+    font-size: 1rem;
+    color: #333; /* 파일 이름 텍스트 색상 */
+}
+
+
+input[type="text"] {
+    width: 100%;
+    padding: 8px;
+    margin: 10px 0;
+}
+
+button {
+    padding: 10px 20px;
+    font-size: 1rem;
+    background-color: #007BFF;
+    color: white;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+}
+
+button:hover {
+    background-color: #0056b3;
+}
+
+#answer,
+#timeTaken {
+    font-size: 1.2rem;
+    color: #333;
+}
+
+.qa-section input[type="text"]{
+    font-size: 1.2rem;
+    width: 100%;
+    padding: 8px;
+    margin-block-end: 10px;
+}

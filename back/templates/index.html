@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Private Data QA Chat</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+
+</head>
+
+<body>
+    <div class="container">
+        <h1>GRP Tagik QA bot ✈️ </h1>
+        <form id="qaForm" method="POST" enctype="multipart/form-data">
+            <!-- 파일 업로드 섹션 -->
+            <div class="upload-section">
+                <label for="file" class="custom-file-upload"> 
+                    파일 선택 
+                </label>
+                <input type="file" id="file" name="file" accept="application/pdf" required>
+                <span id="file-name" class="file-name">선택된 파일 없음</span> <!-- 파일 이름 표시 -->
+                <div id="spinner" class="spinner"></div> <!-- 스피너 추가 -->
+            </div>
+
+            <!-- 질문 입력 섹션 -->
+            <div class="qa-section">
+                <p>업로드된 문서에 기반한 질문에 대해 답변을 제공합니다.</p>
+                <label for="question">질문을 입력하세요</label>
+                <input type="text" id="question" name="question" placeholder="질문을 입력하세요" required>
+                <button type="submit">답변 받기</button>
+            </div>
+        </form>
+
+        <!-- 답변 표시 섹션 -->
+        <div class="answer-section">
+            <p id="answer">답변:</p>
+            <p id="timeTaken"></p> <!-- 답변 생성 시간 표시 -->
+        </div>
+    </div>
+
+    <script src="/static/script.js"></script>
+</body>
+
+
+</html>
