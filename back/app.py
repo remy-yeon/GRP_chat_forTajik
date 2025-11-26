@@ -185,7 +185,8 @@ def upload():
     print("Ensemble retriever created") #디버깅 코드 
     
     #  가져올 모델 입력 
-    llm = load_llm_model("bnksys/yanolja-eeve-korean-instruct-10.8b:latest")
+    # llm = load_llm_model("bnksys/yanolja-eeve-korean-instruct-10.8b:latest")
+    llm = load_llm_model("gemma3:1b") #gemma3:1b 사용 
     print("LLM model loaded") #디버깅 코드 
     
     prompt_template = get_prompt_template()
