@@ -5,7 +5,7 @@ import time  # Import time module
 from flask_cors import CORS
 
 from flask import Flask, request, jsonify, render_template
-from langchain.text_splitter import CharacterTextSplitter
+from langchain_text_splitters import CharacterTextSplitter
 from langchain_community.document_loaders import PyMuPDFLoader
 from kiwipiepy import Kiwi
 from langchain_community.vectorstores import FAISS
