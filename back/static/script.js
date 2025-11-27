@@ -45,8 +45,8 @@ document.getElementById('qaForm').addEventListener('submit', function(event) {
         console.log('선택된 파일:', fileInput.files[0].name);
         fileNameDisplay.textContent = fileInput.files[0].name; // 파일 이름 표시
     }
-
-    fetch("http://203.252.112.49:50080/upload", { // URL 수정: '/upload'로 변경
+    // fetch("http://127.0.0.1:8080/upload", { // URL 수정: '/upload'로 변경
+    fetch("/upload", {        
         method: 'POST',
         body: formData,
         headers: {

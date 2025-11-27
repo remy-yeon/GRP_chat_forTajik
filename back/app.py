@@ -17,6 +17,7 @@ from langchain_community.chat_models import ChatOllama
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
+
 from langchain_experimental.text_splitter import SemanticChunker
 from langchain.schema import Document
 from langchain.document_loaders import PyMuPDFLoader  
@@ -134,10 +135,10 @@ def before_request():
 
 
 
-@app.route('/upload', methods=['POST'])
+@app.route("/upload", methods=["POST"])
 def upload():
     # Debugging - http 통신 확인 겸 
-    print("upload함수 시작") 
+    print("upload 접근::upload함수 시작") 
 
     file = request.files['file']
     print("request file")
