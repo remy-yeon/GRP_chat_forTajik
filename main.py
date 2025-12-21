@@ -1,61 +1,143 @@
+# =============================
+# 설치 / 실행 방법 (로컬)
+# =============================
+# 1) 패키지 설치
+#    pip install fastapi uvicorn langchain langchain-community chromadb sentence-transformers pymupdf
+#    pip install langchain-experimental kiwipiepy
+#    pip install rank-bm25
+#
+# 2) 가상환경 활성화
+#    source .venv/bin/activate
+#
+# 3) Ollama 서버 실행 (LLM 호출용)
+#    ollama serve
+#
+# 4) 모델 다운로드 (최초 1회)
+#    ollama pull gemma2:2b
+#
+# 5) FastAPI 서버 실행
+#    uvicorn main:app --reload
+#
+# 6) Swagger UI
+#    http://127.0.0.1:8000/docs
+
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
+
 import os
+import re
 import shutil
 import uuid
+import time
+from typing import List, Dict
 
-from langchain_community.document_loaders import PyMuPDFLoader
-from langchain_community.document_loaders import TextLoader
+# -----------------------------
+# LangChain / VectorStore
+# -----------------------------
+from langchain.schema import Document
+from langchain_community.document_loaders import PyMuPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.llms import Ollama
+
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 
-app = FastAPI(title="Ollama RAG Demo")
-# uvicorn main:app --reload 해서 실험해볼수 있음
 
-# 프로젝트 기본 경로 설정
+# -----------------------------
+# (선택) 검색 품질 개선 도구
+# -----------------------------
+SEMANTIC_CHUNK_AVAILABLE = True
+try:
+    from langchain_experimental.text_splitter import SemanticChunker
+except Exception:
+    SEMANTIC_CHUNK_AVAILABLE = False
+
+KIWI_AVAILABLE = True
+try:
+    from kiwipiepy import Kiwi
+except Exception:
+    KIWI_AVAILABLE = False
+
+BM25_AVAILABLE = True
+try:
+    from langchain_community.retrievers import BM25Retriever
+except Exception:
+    BM25_AVAILABLE = False
+
+ENSEMBLE_AVAILABLE = True
+try:
+    from langchain.retrievers import EnsembleRetriever
+except Exception:
+    ENSEMBLE_AVAILABLE = False
+
+
+# =============================
+# FastAPI App
+# =============================
+app = FastAPI(title="Ollama RAG Demo")
+
+
+# =============================
+# 경로 설정
+# =============================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 벡터 DB가 디스크에 저장되는 위치
 PERSIST_DIR = os.path.join(BASE_DIR, "chroma_db")
 
-# Embedding 모델 -> 텍스트를 벡터로 바꿔줌.
+# 업로드 파일 임시 저장 위치
+TEMP_DIR = os.path.join(BASE_DIR, "temp_uploads")
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+
+# =============================
+# Embedding / LLM 설정
+# =============================
+# 문서와 질문을 벡터로 변환하는 임베딩 모델
 embedding = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
+    model_name="intfloat/multilingual-e5-large-instruct",
+    encode_kwargs={"normalize_embeddings": True},
 )
 
-# LLM 모델 (Ollama의 gemma2-2b) -> 답변을 생성할때 사용
+# Ollama로 로컬 LLM 호출
 llm = Ollama(model="gemma2:2b")
 
-# Chroma DB 불러오기
-def get_vectorstore():
-    vectordb = Chroma(
-        persist_directory=PERSIST_DIR, # 디렉토리가 있으면 이어서 쓰고 없으면 생성
-        embedding_function=embedding
-    )
-    return vectordb
 
-# 질문 Body 형식
-class Question(BaseModel): # Pydantic BaseModel은 JSON 데이터를 Python 객체로 변환하는 툴임.
+# =============================
+# Chroma Vector DB 로딩
+# =============================
+def get_vectorstore() -> Chroma:
+    """
+    - chroma_db 폴더가 있으면 기존 DB를 그대로 사용
+    - 서버 재시작해도 문서가 유지됨
+    """
+    return Chroma(
+        persist_directory=PERSIST_DIR,
+        embedding_function=embedding,
+    )
+
+
+# =============================
+# 요청 바디 모델
+# =============================
+class Question(BaseModel):
     question: str
 
-#{
-#  "question": "UHPC?"   ->  Question(question="UHPC?")
-#}
 
-# 답변이 바로 시작하도록 하는 Prompt (불필요한 문장 금지)
+# =============================
+# Prompt Template
+# =============================
 prompt = PromptTemplate(
-    input_variables=["context", "question"], # 나중에 chain이 context,question을 채움.
+    input_variables=["context", "question"],
     template="""
-Using the context below, answer the user's question with a clear and complete explanation.
-Provide additional helpful details and background information when relevant.
-Do not say phrases like "Based on the provided text" or "According to the document."
-Start your answer naturally without introductory phrases.
-Use only the information from the provided context.
-If the answer is not explicitly stated in the context, say:
+Using the context below, answer the user's question.
+Use only the information from the context.
+If the answer is not in the context, say:
 "The document does not contain information about this topic."
-Do not add or invent any external facts.
 
 Context:
 {context}
@@ -67,132 +149,235 @@ Answer:
 """
 )
 
+
+# =============================
+# 텍스트 전처리
+# =============================
+def preprocess_text(text: str) -> str:
+    """
+    - 문서에서 불필요한 공백 제거
+    - 노이즈 단어 간단 정리
+    """
+    text = text.replace("ft", "처")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def preprocess_documents(docs: List[Document]) -> List[Document]:
+    """
+    - loader가 읽어온 모든 문서에 전처리 적용
+    """
+    for d in docs:
+        d.page_content = preprocess_text(d.page_content)
+    return docs
+
+
+# =============================
+# 문서 청킹
+# =============================
+def split_documents_semantic_first(
+    docs: List[Document],
+    use_semantic: bool = True,
+    chunk_size_fallback: int = 500,
+    chunk_overlap_fallback: int = 50,
+) -> List[Document]:
+    """
+    문서를 LLM이 처리 가능한 크기의 chunk로 분할
+    1) SemanticChunker 가능하면 의미 단위 분할
+    2) 아니면 일반 문자 기반 분할
+    """
+    if use_semantic and SEMANTIC_CHUNK_AVAILABLE:
+        try:
+            return SemanticChunker(embedding).split_documents(docs)
+        except Exception:
+            pass
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size_fallback,
+        chunk_overlap=chunk_overlap_fallback,
+    )
+    return splitter.split_documents(docs)
+
+
+# =============================
+# BM25 Retriever 생성
+# =============================
+def build_bm25_retriever_from_chroma(vectordb: Chroma, k: int = 3):
+    """
+    - Chroma에 저장된 문서를 기반으로 키워드 검색(BM25) 인덱스 생성
+    - 벡터 검색의 약점을 보완하기 위한 용도
+    """
+    if not BM25_AVAILABLE:
+        return None
+
+    data = vectordb._collection.get(include=["documents", "metadatas"])
+    docs = []
+
+    for text, meta in zip(data.get("documents", []), data.get("metadatas", [])):
+        if text:
+            docs.append(Document(page_content=text, metadata=meta or {}))
+
+    if not docs:
+        return None
+
+    if KIWI_AVAILABLE:
+        kiwi = Kiwi()
+        preprocess_func = lambda t: [x.form for x in kiwi.tokenize(t)]
+    else:
+        preprocess_func = lambda t: t.split()
+
+    bm25 = BM25Retriever.from_documents(docs, preprocess_func=preprocess_func)
+    bm25.k = k
+    return bm25
+
+
+# =============================
 # 파일 업로드 API
-@app.post("/upload_file") # fastApi는 BaseModel을 보고 Body데이터를 자동으로 파싱해줌.
-async def upload_file(file: UploadFile = File(...)): # form-data에서 업로드된 파일을 받겠다는 의미, ...->필수라는 의미
+# =============================
+@app.post("/upload_file")
+async def upload_file(file: UploadFile = File(...)):
+    """
+    흐름:
+    1) 파일 임시 저장
+    2) PDF/TXT 로더로 문서 읽기
+    3) 전처리
+    4) 청킹
+    5) Chroma DB에 벡터로 저장
+    """
 
-    filename = file.filename # 업로드 된 파일 이름 저장
-    temp_path = "temp_" + filename # 서버에 저장하는 경로 설정
+    temp_path = os.path.join(TEMP_DIR, f"{uuid.uuid4()}_{file.filename}")
 
-    # 업로드된 파일 저장
-    # f 라는 파일을 열고 밑에 다 실행하고 close까지 해줌.
-    with open(temp_path, "wb") as f: # pdf,이미지,업로드 관련은 바이너리로 다뤄야 하기 때문에 wb사용
+    with open(temp_path, "wb") as f:
         f.write(await file.read())
 
-    # txt 혹은 pdf 로더 선택
-    if filename.endswith(".txt"):
-        loader = TextLoader(temp_path, encoding="utf-8")
-    elif filename.endswith(".pdf"):
+    if file.filename.endswith(".pdf"):
         loader = PyMuPDFLoader(temp_path)
+    elif file.filename.endswith(".txt"):
+        loader = TextLoader(temp_path, encoding="utf-8")
     else:
-        os.remove(temp_path)
-        raise HTTPException(status_code=400, detail="txt, pdf만 업로드 가능합니다.")
+        raise HTTPException(status_code=400, detail="Only pdf or txt allowed")
 
-    # 문서 로드
-    docs = loader.load()
+    docs = preprocess_documents(loader.load())
+    chunks = split_documents_semantic_first(docs)
 
-    # chunk 분리
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50
-    )
-    split_docs = splitter.split_documents(docs)
-
-    # 문서 고유 ID 생성
-    doc_uuid = str(uuid.uuid4()) # uuid.uuid4() 랜덤한 고유 id 생성
-    for d in split_docs:
-        d.metadata["doc_id"] = doc_uuid
-        d.metadata["source"] = filename
+    doc_id = str(uuid.uuid4())
+    for i, d in enumerate(chunks):
+        d.metadata["doc_id"] = doc_id
+        d.metadata["source"] = file.filename
+        d.metadata["chunk_index"] = i
 
     vectordb = get_vectorstore()
+    vectordb.add_documents(chunks)
+    vectordb.persist()
 
-    # 파일 중복 업로드 시 기존 chunk 삭제
-    # existing = vectordb._collection.get(where={"source": filename})
-    # if existing and existing["ids"]:
-    #     vectordb._collection.delete(existing["ids"])
-    vectordb._collection.delete(where={"source": filename})
-
-    # 새로운 chunk 저장 , 내부적으로 임베딩 실행
-    vectordb.add_documents(split_docs)
-
-    # 임시 파일 삭제
     os.remove(temp_path)
 
     return {
         "status": "ok",
-        "message": f"{filename} uploaded and indexed",
-        "chunks_added": len(split_docs),
-        "doc_id": doc_uuid
+        "filename": file.filename,
+        "chunks": len(chunks),
+        "doc_id": doc_id,
     }
 
-# 업로드된 문서 목록 조회
-@app.get("/list_documents")
-async def list_documents():
-    vectordb = get_vectorstore()
-    data = vectordb._collection.get() # _collection.get() 전체 벡터데이터
 
-    docs = {}
-    #doc_id는 “문서 하나를 대표하는 ID” 이고 그 문서는 여러 chunk로 쪼개지기 때문에 하나의 doc_id는 여러 metadata에서 반복된다.
-    for meta in data.get("metadatas", []): # 각 벡터에 대응되는 메타데이터 리스트 , doc_id,source 현재 두개만 있음.
-        if meta is None:
-            continue
-        docs[meta["doc_id"]] = meta["source"] # doc_id가 여러번 나오면 마지막 값으로 덮어씌워짐
-
-    return {"documents": docs}
-
-# 특정 문서 삭제
-@app.delete("/delete_document")
-async def delete_document(doc_id: str):
-
-    vectordb = get_vectorstore()
-    data = vectordb._collection.get(where={"doc_id": doc_id})
-
-    if not data["ids"]:
-        raise HTTPException(status_code=404, detail="Document not found.")
-
-    vectordb._collection.delete(data["ids"])
-
-    return {
-        "status": "ok",
-        "deleted_chunks": len(data["ids"])
-    }
-
-# 전체 문서 삭제 (초기화)
-@app.delete("/clear_all")
-async def clear_all():
-    if os.path.exists(PERSIST_DIR):
-        shutil.rmtree(PERSIST_DIR)
-    return {"status": "ok", "message": "All data cleared"}
-
-# 질문 API (RAG)
+# =============================
+# 질문 API (RAG) 
+# =============================
 @app.post("/ask")
 async def ask_question(item: Question):
+    """
+    전체 RAG 흐름:
+    질문 →
+    (Vector 검색 + BM25 검색) →
+    관련 문서 context 수집 →
+    LLM 답변 생성
+    """
 
     vectordb = get_vectorstore()
-    retriever = vectordb.as_retriever(search_kwargs={"k": 3}) # 가장 유사한 3개의 chunk를 반환하는 retriever 객체 생성.
+
+    # Vector 기반 검색 , 의미는 잘 잡지만 근거가 흐릴 수 있음
+    vector_retriever = vectordb.as_retriever(search_kwargs={"k": 3})
+
+    # BM25 기반 검색, 근거는 정확하지만 표현 변화에 약함
+    bm25_retriever = build_bm25_retriever_from_chroma(vectordb, k=3)
+
+    # 두 검색 결과를 앙상블로 결합
+    retriever = vector_retriever
+    if bm25_retriever and ENSEMBLE_AVAILABLE:
+        retriever = EnsembleRetriever(
+            retrievers=[bm25_retriever, vector_retriever],
+            weights=[0.6, 0.4],
+        )
 
     chain = RetrievalQA.from_chain_type(
         llm=llm,
         retriever=retriever,
         chain_type_kwargs={"prompt": prompt},
-        return_source_documents=True
+        return_source_documents=True,
     )
 
-    result = chain.invoke({"query": item.question}) # result dictionary임,query,result,source_documnets
-
-    #Document(page_content="...", metadata={"source": "a.pdf", "page": 0}),
-    #Document(page_content="...", metadata={"source": "a.pdf", "page": 1}),
-    #Document(page_content="...", metadata={"source": "b.txt"})
+    # 응답 시간 측정
+    start = time.time()
+    result = chain.invoke({"query": item.question})
+    elapsed = round(time.time() - start, 3)
 
     return {
         "question": item.question,
         "answer": result["result"],
+        "elapsed_time_sec": elapsed,
         "sources": [
             {
-                "source": doc.metadata.get("source", "unknown"),
-                "page": doc.metadata.get("page", -1)
+                "source": d.metadata.get("source"),
+                "page": d.metadata.get("page", -1),
+                "chunk_index": d.metadata.get("chunk_index"),
+                "doc_id": d.metadata.get("doc_id"),
             }
-            for doc in result["source_documents"]
-        ]
+            for d in result["source_documents"]
+        ],
     }
 
+
+# =============================
+# 문서 목록 조회
+# =============================
+@app.get("/list_documents")
+async def list_documents():
+    """
+    - DB에 들어있는 문서(doc_id 기준) 목록 확인
+    """
+    vectordb = get_vectorstore()
+    data = vectordb._collection.get(include=["metadatas"])
+
+    docs: Dict[str, str] = {}
+    for m in data["metadatas"]:
+        docs[m["doc_id"]] = m["source"]
+
+    return {"documents": docs}
+
+
+# =============================
+# 문서 삭제
+# =============================
+@app.delete("/delete_document")
+async def delete_document(doc_id: str):
+    """
+    - 특정 문서(doc_id)에 해당하는 모든 chunk 삭제
+    """
+    vectordb = get_vectorstore()
+    data = vectordb._collection.get(where={"doc_id": doc_id})
+
+    vectordb._collection.delete(data["ids"])
+    return {"deleted_chunks": len(data["ids"])}
+
+
+# =============================
+# 전체 초기화
+# =============================
+@app.delete("/clear_all")
+async def clear_all():
+    """
+    - chroma_db 폴더 삭제 → 모든 문서/임베딩 제거
+    """
+    if os.path.exists(PERSIST_DIR):
+        shutil.rmtree(PERSIST_DIR)
+    return {"status": "ok"}
