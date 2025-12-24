@@ -1,0 +1,1003 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ollama RAG Chat</title>
+    <style>
+        /* =============================================
+           Phase 1: 기본 구조 및 레이아웃
+           ============================================= */
+
+        /* ----- CSS 리셋 및 기본 설정 ----- */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html, body {
+            height: 100%;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-size: 15px;
+            line-height: 1.5;
+        }
+
+        /* ----- 다크 테마 색상 변수 ----- */
+        :root {
+            /* 배경 색상 */
+            --bg-main: #212121;
+            --bg-sidebar: #171717;
+            --bg-input: #2F2F2F;
+
+            /* 텍스트 색상 */
+            --text-primary: #ECECEC;
+            --text-secondary: #8E8E8E;
+
+            /* 액센트 색상 */
+            --accent: #10A37F;
+            --accent-hover: #0D8A6A;
+
+            /* 테두리 및 구분선 */
+            --border-color: #3E3E3E;
+
+            /* 메시지 버블 */
+            --user-bubble: #2F2F2F;
+            --assistant-bubble: transparent;
+
+            /* 모서리 반경 */
+            --radius-message: 12px;
+            --radius-input: 24px;
+        }
+
+        /* ----- 기본 body 스타일 ----- */
+        body {
+            background-color: var(--bg-main);
+            color: var(--text-primary);
+        }
+
+        /* ----- 앱 컨테이너 (Flexbox 레이아웃) ----- */
+        .app-container {
+            display: flex;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* ----- 사이드바 기본 스타일 ----- */
+        .sidebar {
+            width: 260px;
+            background-color: var(--bg-sidebar);
+            border-right: 1px solid var(--border-color);
+            display: flex;
+            flex-direction: column;
+            flex-shrink: 0;
+            height: 100vh;
+        }
+
+        /* ----- 메인 채팅 영역 ----- */
+        .chat-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-width: 0; /* flexbox 오버플로우 방지 */
+        }
+
+        /* =============================================
+           Phase 2: 채팅 UI
+           ============================================= */
+
+        /* ----- 채팅 헤더 ----- */
+        .chat-header {
+            display: flex;
+            align-items: center;
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border-color);
+            background-color: var(--bg-main);
+        }
+
+        .menu-toggle {
+            display: none; /* 데스크톱에서는 숨김 */
+            background: none;
+            border: none;
+            color: var(--text-primary);
+            font-size: 24px;
+            cursor: pointer;
+            padding: 8px;
+            margin-right: 12px;
+        }
+
+        .chat-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        /* ----- 메시지 컨테이너 ----- */
+        .messages-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        /* 스크롤바 스타일링 */
+        .messages-container::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        .messages-container::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        .messages-container::-webkit-scrollbar-thumb {
+            background-color: var(--border-color);
+            border-radius: 4px;
+        }
+
+        /* ----- 환영 메시지 ----- */
+        .welcome-message {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            text-align: center;
+            color: var(--text-secondary);
+        }
+
+        .welcome-message h2 {
+            font-size: 24px;
+            color: var(--text-primary);
+            margin-bottom: 8px;
+        }
+
+        .welcome-message p {
+            font-size: 15px;
+        }
+
+        /* ----- 메시지 버블 ----- */
+        .message {
+            display: flex;
+            gap: 12px;
+            max-width: 800px;
+            width: 100%;
+            margin: 0 auto;
+        }
+
+        /* 사용자 메시지: 우측 정렬 (중앙 영역 내에서) */
+        .message.user {
+            flex-direction: row-reverse;
+            justify-content: flex-start;
+        }
+
+        /* AI 메시지: 좌측 정렬 (중앙 영역 내에서) */
+        .message.assistant {
+            flex-direction: row;
+            justify-content: flex-start;
+        }
+
+        .message-avatar {
+            width: 36px;
+            height: 36px;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            flex-shrink: 0;
+        }
+
+        .message.user .message-avatar {
+            background-color: var(--accent);
+        }
+
+        .message.assistant .message-avatar {
+            background-color: #6B5B95;
+        }
+
+        .message-content {
+            flex: 0 1 auto;
+            max-width: 70%;
+            padding: 12px 16px;
+            border-radius: var(--radius-message);
+            line-height: 1.6;
+        }
+
+        .message.user .message-content {
+            background-color: var(--user-bubble);
+            border-radius: 18px 18px 4px 18px;
+        }
+
+        .message.assistant .message-content {
+            background-color: var(--assistant-bubble);
+            border-radius: 18px 18px 18px 4px;
+        }
+
+        /* ----- 입력 영역 ----- */
+        .input-area {
+            padding: 16px 24px 24px;
+            background-color: var(--bg-main);
+        }
+
+        .input-wrapper {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            max-width: 800px;
+            margin: 0 auto;
+            background-color: var(--bg-input);
+            border-radius: var(--radius-input);
+            padding: 12px 16px;
+            border: 1px solid var(--border-color);
+        }
+
+        .input-wrapper:focus-within {
+            border-color: var(--accent);
+        }
+
+        .message-input {
+            flex: 1;
+            background: none;
+            border: none;
+            color: var(--text-primary);
+            font-size: 15px;
+            resize: none;
+            outline: none;
+            min-height: 24px;
+            max-height: 200px;
+            font-family: inherit;
+            line-height: 1.5;
+        }
+
+        .message-input::placeholder {
+            color: var(--text-secondary);
+        }
+
+        .send-btn {
+            background-color: var(--accent);
+            border: none;
+            color: white;
+            width: 36px;
+            height: 36px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background-color 0.2s;
+        }
+
+        .send-btn:hover {
+            background-color: var(--accent-hover);
+        }
+
+        .send-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        /* =============================================
+           Phase 3: 파일 업로드
+           ============================================= */
+
+        /* ----- 업로드 진행 표시 ----- */
+        .upload-indicator {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 16px;
+            background-color: rgba(16, 163, 127, 0.1);
+            border-radius: 8px;
+            margin-bottom: 8px;
+            max-width: 800px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        .upload-spinner {
+            width: 16px;
+            height: 16px;
+            border: 2px solid var(--accent);
+            border-top-color: transparent;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        .upload-text {
+            color: var(--accent);
+            font-size: 14px;
+        }
+
+        /* ----- 토스트 알림 ----- */
+        .toast {
+            position: fixed;
+            bottom: 100px;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 12px 24px;
+            border-radius: 8px;
+            color: white;
+            font-size: 14px;
+            z-index: 1000;
+            animation: fadeInOut 3s ease-in-out forwards;
+        }
+
+        .toast.success {
+            background-color: var(--accent);
+        }
+
+        .toast.error {
+            background-color: #E74C3C;
+        }
+
+        @keyframes fadeInOut {
+            0% { opacity: 0; transform: translateX(-50%) translateY(20px); }
+            10% { opacity: 1; transform: translateX(-50%) translateY(0); }
+            90% { opacity: 1; transform: translateX(-50%) translateY(0); }
+            100% { opacity: 0; transform: translateX(-50%) translateY(20px); }
+        }
+
+        /* =============================================
+           Phase 4: 문서 관리 사이드바
+           ============================================= */
+
+        /* ----- 사이드바 헤더 ----- */
+        .sidebar-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .sidebar-title {
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .sidebar-close {
+            display: none; /* 데스크톱에서는 숨김 */
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            font-size: 18px;
+            cursor: pointer;
+            padding: 4px 8px;
+            border-radius: 4px;
+        }
+
+        .sidebar-close:hover {
+            background-color: rgba(255, 255, 255, 0.1);
+            color: var(--text-primary);
+        }
+
+        /* ----- 문서 목록 ----- */
+        .documents-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px;
+        }
+
+        .documents-list::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .documents-list::-webkit-scrollbar-thumb {
+            background-color: var(--border-color);
+            border-radius: 3px;
+        }
+
+        .empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            text-align: center;
+            color: var(--text-secondary);
+            padding: 24px;
+        }
+
+        .empty-state p {
+            margin-bottom: 8px;
+        }
+
+        .empty-hint {
+            font-size: 13px;
+            opacity: 0.7;
+        }
+
+        /* ----- 문서 항목 ----- */
+        .document-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 12px;
+            border-radius: 8px;
+            cursor: default;
+            transition: background-color 0.2s;
+        }
+
+        .document-item:hover {
+            background-color: rgba(255, 255, 255, 0.05);
+        }
+
+        .document-icon {
+            font-size: 16px;
+            flex-shrink: 0;
+        }
+
+        .document-name {
+            flex: 1;
+            font-size: 14px;
+            color: var(--text-primary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .document-delete {
+            opacity: 0;
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            font-size: 14px;
+            cursor: pointer;
+            padding: 4px 8px;
+            border-radius: 4px;
+            transition: opacity 0.2s, background-color 0.2s;
+        }
+
+        .document-item:hover .document-delete {
+            opacity: 1;
+        }
+
+        .document-delete:hover {
+            background-color: rgba(231, 76, 60, 0.2);
+            color: #E74C3C;
+        }
+
+        /* ----- 사이드바 푸터 ----- */
+        .sidebar-footer {
+            padding: 12px;
+            border-top: 1px solid var(--border-color);
+        }
+
+        .clear-all-btn {
+            width: 100%;
+            padding: 10px;
+            background-color: transparent;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            color: var(--text-secondary);
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .clear-all-btn:hover {
+            background-color: rgba(231, 76, 60, 0.1);
+            border-color: #E74C3C;
+            color: #E74C3C;
+        }
+
+        .clear-all-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .clear-all-btn:disabled:hover {
+            background-color: transparent;
+            border-color: var(--border-color);
+            color: var(--text-secondary);
+        }
+
+        /* ----- 모바일 오버레이 ----- */
+        .sidebar-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: rgba(0, 0, 0, 0.5);
+            z-index: 99;
+        }
+
+        .sidebar-overlay.active {
+            display: block;
+        }
+
+        /* =============================================
+           Phase 6: 반응형 디자인
+           ============================================= */
+
+        /* ----- 모바일 기본 스타일 (< 768px) ----- */
+        @media (max-width: 767px) {
+            /* 사이드바 - 모바일에서 슬라이드 메뉴 */
+            .sidebar {
+                position: fixed;
+                top: 0;
+                left: -100%;
+                width: 80%;
+                max-width: 300px;
+                height: 100vh;
+                z-index: 100;
+                transition: left 0.3s ease;
+            }
+
+            .sidebar.open {
+                left: 0;
+            }
+
+            /* 사이드바 닫기 버튼 표시 */
+            .sidebar-close {
+                display: block;
+            }
+
+            /* 햄버거 메뉴 표시 */
+            .menu-toggle {
+                display: flex;
+            }
+
+            /* 메시지 패딩 조정 */
+            .messages-container {
+                padding: 16px;
+            }
+
+            /* 입력 영역 패딩 조정 */
+            .input-area {
+                padding: 12px 16px 16px;
+            }
+
+            /* 환영 메시지 크기 조정 */
+            .welcome-message h2 {
+                font-size: 20px;
+            }
+        }
+
+        /* ----- 데스크톱 스타일 (≥ 768px) ----- */
+        @media (min-width: 768px) {
+            /* 사이드바 - 항상 표시 */
+            .sidebar {
+                position: relative;
+                left: 0;
+                width: 260px;
+            }
+
+            /* 사이드바 닫기 버튼 숨김 */
+            .sidebar-close {
+                display: none;
+            }
+
+            /* 햄버거 메뉴 숨김 */
+            .menu-toggle {
+                display: none;
+            }
+
+            /* 오버레이 비활성화 */
+            .sidebar-overlay {
+                display: none !important;
+            }
+        }
+
+        /* =============================================
+           Phase 7: 로딩 상태 및 출처 표시
+           ============================================= */
+
+        /* ----- 타이핑 인디케이터 ----- */
+        .typing-message {
+            opacity: 0.7;
+        }
+
+        .typing-dots {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 0;
+        }
+
+        .typing-dots span {
+            width: 8px;
+            height: 8px;
+            background-color: var(--text-secondary);
+            border-radius: 50%;
+            animation: typingBounce 1.4s infinite ease-in-out;
+        }
+
+        .typing-dots span:nth-child(1) {
+            animation-delay: 0s;
+        }
+
+        .typing-dots span:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+
+        .typing-dots span:nth-child(3) {
+            animation-delay: 0.4s;
+        }
+
+        @keyframes typingBounce {
+            0%, 60%, 100% {
+                transform: translateY(0);
+                opacity: 0.4;
+            }
+            30% {
+                transform: translateY(-6px);
+                opacity: 1;
+            }
+        }
+
+        /* ----- 출처 섹션 ----- */
+        .sources-section {
+            margin-top: 16px;
+            padding-top: 12px;
+            border-top: 1px solid var(--border-color);
+        }
+
+        .sources-header {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 8px;
+            color: var(--text-secondary);
+            font-size: 13px;
+        }
+
+        .sources-icon {
+            font-size: 14px;
+        }
+
+        .sources-title {
+            font-weight: 500;
+        }
+
+        .sources-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .source-item {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 10px;
+            background-color: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            font-size: 13px;
+            color: var(--text-primary);
+            transition: background-color 0.2s;
+        }
+
+        .source-item:hover {
+            background-color: rgba(255, 255, 255, 0.1);
+        }
+
+        .source-file {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .source-page {
+            color: var(--text-secondary);
+            font-size: 12px;
+        }
+
+        /* ----- 에러 메시지 스타일 ----- */
+        .message-content.error {
+            background-color: rgba(231, 76, 60, 0.1);
+            border: 1px solid rgba(231, 76, 60, 0.3);
+            color: #E74C3C;
+        }
+    </style>
+</head>
+<body>
+    <div class="app-container">
+        <!-- 메인 채팅 영역 -->
+        <main class="chat-container">
+            <!-- 헤더 -->
+            <header class="chat-header">
+                <h1 class="chat-title">Ollama RAG Chat</h1>
+            </header>
+
+            <!-- 메시지 표시 영역 -->
+            <div class="messages-container" id="messagesContainer">
+                <!-- 환영 메시지 (대화 시작 전) -->
+                <div class="welcome-message" id="welcomeMessage">
+                    <h2>무엇을 도와드릴까요?</h2>
+                    <p>등록된 문서를 기반으로 질문에 답변해 드립니다.</p>
+                </div>
+
+                <!-- 메시지들이 여기에 동적으로 추가됨 -->
+            </div>
+
+            <!-- 입력 영역 -->
+            <div class="input-area">
+                <div class="input-wrapper">
+                    <!-- 메시지 입력창 -->
+                    <textarea
+                        class="message-input"
+                        id="messageInput"
+                        placeholder="메시지를 입력하세요..."
+                        rows="1"
+                    ></textarea>
+
+                    <!-- 전송 버튼 -->
+                    <button class="send-btn" id="sendBtn" aria-label="전송">
+                        ➤
+                    </button>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        /* =============================================
+           앱 상태 관리
+           ============================================= */
+
+        const state = {
+            messages: [],
+            isLoading: false
+        };
+
+        /* =============================================
+           Phase 2: 채팅 UI JavaScript
+           ============================================= */
+
+        // HTML 이스케이프 함수 (XSS 방지)
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // 메시지 렌더링 함수
+        function renderMessage(message) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${message.role}`;
+
+            const avatar = message.role === 'user' ? '👤' : '🤖';
+            const contentClass = message.isError ? 'message-content error' : 'message-content';
+
+            let contentHtml = escapeHtml(message.content).replace(/\n/g, '<br>');
+
+            // 출처가 있는 경우 추가
+            if (message.sources && message.sources.length > 0) {
+                contentHtml += renderSources(message.sources);
+            }
+
+            messageDiv.innerHTML = `
+                <div class="message-avatar">${avatar}</div>
+                <div class="${contentClass}">${contentHtml}</div>
+            `;
+
+            return messageDiv;
+        }
+
+        // 출처 렌더링 함수
+        function renderSources(sources) {
+            if (!sources || sources.length === 0) return '';
+
+            const sourceItems = sources.map(source => {
+                const filename = typeof source.source === 'string'
+                    ? source.source
+                    : (typeof source.file === 'string' ? source.file : 'unknown');
+                const icon = filename.toLowerCase().endsWith('.pdf') ? '📕' : '📄';
+                const pageInfo = source.page ? `<span class="source-page">p.${source.page}</span>` : '';
+
+                return `
+                    <div class="source-item">
+                        <span class="source-file">${icon} ${escapeHtml(filename)}</span>
+                        ${pageInfo}
+                    </div>
+                `;
+            }).join('');
+
+            return `
+                <div class="sources-section">
+                    <div class="sources-header">
+                        <span class="sources-icon">📚</span>
+                        <span class="sources-title">참조 문서 (${sources.length})</span>
+                    </div>
+                    <div class="sources-list">
+                        ${sourceItems}
+                    </div>
+                </div>
+            `;
+        }
+
+        // 텍스트 영역 자동 크기 조절
+        function autoResizeTextarea(textarea) {
+            textarea.style.height = 'auto';
+            textarea.style.height = Math.min(textarea.scrollHeight, 200) + 'px';
+        }
+
+        // 메시지 전송 처리
+        function handleSendMessage() {
+            const input = document.getElementById('messageInput');
+            const content = input.value.trim();
+
+            if (!content || state.isLoading) return;
+
+            // 사용자 메시지 추가
+            const userMessage = { role: 'user', content };
+            state.messages.push(userMessage);
+
+            // UI 업데이트
+            const container = document.getElementById('messagesContainer');
+            const welcomeMsg = document.getElementById('welcomeMessage');
+            if (welcomeMsg) welcomeMsg.style.display = 'none';
+
+            container.appendChild(renderMessage(userMessage));
+
+            // 입력창 초기화
+            input.value = '';
+            autoResizeTextarea(input);
+
+            // 스크롤 맨 아래로
+            container.scrollTop = container.scrollHeight;
+
+            // API 호출 (Phase 5에서 구현)
+            sendToAPI(content);
+        }
+
+        /* =============================================
+           Phase 5: API 연동
+           ============================================= */
+
+        // API 기본 설정
+        // 같은 서버에서 실행 시 빈 문자열, 별도 서버면 URL 입력
+        // 예: const API_BASE_URL = 'http://localhost:8000';
+        const API_BASE_URL = '';
+        const REQUEST_TIMEOUT = 60000; // 60초 타임아웃 (LLM 응답 대기)
+
+        // 타이핑 인디케이터 표시
+        function showTypingIndicator() {
+            const container = document.getElementById('messagesContainer');
+            hideTypingIndicator();
+
+            const indicator = document.createElement('div');
+            indicator.className = 'message assistant typing-message';
+            indicator.id = 'typingIndicator';
+
+            indicator.innerHTML = `
+                <div class="message-avatar">🤖</div>
+                <div class="message-content">
+                    <div class="typing-dots">
+                        <span></span>
+                        <span></span>
+                        <span></span>
+                    </div>
+                </div>
+            `;
+
+            container.appendChild(indicator);
+            container.scrollTop = container.scrollHeight;
+        }
+
+        // 타이핑 인디케이터 제거
+        function hideTypingIndicator() {
+            const indicator = document.getElementById('typingIndicator');
+            if (indicator) {
+                indicator.remove();
+            }
+        }
+
+        // API 호출 함수
+        async function sendToAPI(question) {
+            try {
+                state.isLoading = true;
+                disableInputs(true);
+                showTypingIndicator();
+
+                // 타임아웃 설정
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+
+                const response = await fetch(`${API_BASE_URL}/chat`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ question }),
+                    signal: controller.signal
+                });
+
+                clearTimeout(timeoutId);
+
+                if (!response.ok) {
+                    throw new Error(`서버 오류: ${response.status}`);
+                }
+
+                const data = await response.json();
+                hideTypingIndicator();
+
+                // AI 답변 추가
+                const assistantMessage = {
+                    role: 'assistant',
+                    content: data.answer,
+                    sources: data.sources || []
+                };
+
+                state.messages.push(assistantMessage);
+
+                const container = document.getElementById('messagesContainer');
+                container.appendChild(renderMessage(assistantMessage));
+                container.scrollTop = container.scrollHeight;
+
+            } catch (error) {
+                console.error('질문 전송 오류:', error);
+                hideTypingIndicator();
+
+                let errorMsg = '오류가 발생했습니다.';
+                if (error.name === 'AbortError') {
+                    errorMsg = '요청 시간이 초과되었습니다. 다시 시도해주세요.';
+                } else if (error.message) {
+                    errorMsg = error.message;
+                }
+
+                // 에러 메시지 표시
+                const errorMessage = {
+                    role: 'assistant',
+                    content: errorMsg,
+                    isError: true
+                };
+
+                state.messages.push(errorMessage);
+                const container = document.getElementById('messagesContainer');
+                container.appendChild(renderMessage(errorMessage));
+                container.scrollTop = container.scrollHeight;
+
+            } finally {
+                state.isLoading = false;
+                disableInputs(false);
+            }
+        }
+
+        // 입력 비활성화/활성화
+        function disableInputs(disabled) {
+            const messageInput = document.getElementById('messageInput');
+            const sendBtn = document.getElementById('sendBtn');
+
+            if (messageInput) messageInput.disabled = disabled;
+            if (sendBtn) sendBtn.disabled = disabled;
+        }
+
+        // DOM 로드 완료 시 이벤트 리스너 설정
+        document.addEventListener('DOMContentLoaded', () => {
+            const messageInput = document.getElementById('messageInput');
+            const sendBtn = document.getElementById('sendBtn');
+
+            // 전송 버튼 클릭
+            sendBtn.addEventListener('click', handleSendMessage);
+
+            // Enter 키로 전송 (Shift+Enter는 줄바꿈)
+            messageInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    handleSendMessage();
+                }
+            });
+
+            // 텍스트 영역 자동 크기 조절
+            messageInput.addEventListener('input', () => {
+                autoResizeTextarea(messageInput);
+            });
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log
+
+# Data storage (if contains sensitive/large files)
+chroma_db/
+data_storage/
+temp_uploads/
+
+# IDE
+.idea/
+.vscode/

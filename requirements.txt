@@ -1,0 +1,27 @@
+# FastAPI 서버
+fastapi==0.104.1
+uvicorn==0.24.0
+python-multipart==0.0.6
+
+# PDF 처리
+pdfplumber==0.10.3
+pymupdf
+
+# LangChain RAG
+langchain
+langchain-community
+langchain-experimental
+
+# 벡터 DB & 임베딩
+chromadb
+sentence-transformers
+
+# 한국어 처리 & 검색 개선
+kiwipiepy
+rank-bm25
+
+# Embeddings / LLM (Arctic + Ollama)
+torch
+transformers
+langchain-chroma
+langchain-ollama
