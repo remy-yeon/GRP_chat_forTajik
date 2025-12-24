@@ -1,383 +1,413 @@
-# =============================
-# 설치 / 실행 방법 (로컬)
-# =============================
-# 1) 패키지 설치
-#    pip install fastapi uvicorn langchain langchain-community chromadb sentence-transformers pymupdf
-#    pip install langchain-experimental kiwipiepy
-#    pip install rank-bm25
-#
-# 2) 가상환경 활성화
-#    source .venv/bin/activate
-#
-# 3) Ollama 서버 실행 (LLM 호출용)
-#    ollama serve
-#
-# 4) 모델 다운로드 (최초 1회)
-#    ollama pull gemma2:2b
-#
-# 5) FastAPI 서버 실행
-#    uvicorn main:app --reload
-#
-# 6) Swagger UI
-#    http://127.0.0.1:8000/docs
-
-
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from pydantic import BaseModel
-
+# 0. Python Standard Library (기본 내장 라이브러리)
 import os
 import re
 import shutil
-import uuid
 import time
-from typing import List, Dict
+import uuid
+from typing import List, Optional, Dict
+from contextlib import asynccontextmanager
 
-# -----------------------------
-# LangChain / VectorStore
-# -----------------------------
+# 1. PyTorch (모델 연산 / 임베딩 계산)
+import torch
+import torch.nn.functional as F
+
+# 2. FastAPI & Pydantic (API 서버 / 요청·응답 모델)
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from pydantic import BaseModel
+
+# 3. LangChain Core (문서, 프롬프트, 출력 파싱)
 from langchain.schema import Document
+from langchain_core.embeddings import Embeddings
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+# 4. LangChain Document Loaders & Text Splitters
 from langchain_community.document_loaders import PyMuPDFLoader, TextLoader
+from langchain_experimental.text_splitter import SemanticChunker
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.llms import Ollama
+# 5. Vector Store (ChromaDB)
+from langchain_chroma import Chroma
 
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
+# 6. Retriever (검색 로직)
+from langchain_community.retrievers import BM25Retriever
+from langchain.retrievers import EnsembleRetriever
 
+# 7. LLM (Ollama 기반 Gemma 2)
+from langchain_ollama import ChatOllama
 
-# -----------------------------
-# (선택) 검색 품질 개선 도구
-# -----------------------------
-SEMANTIC_CHUNK_AVAILABLE = True
-try:
-    from langchain_experimental.text_splitter import SemanticChunker
-except Exception:
-    SEMANTIC_CHUNK_AVAILABLE = False
-
-KIWI_AVAILABLE = True
-try:
-    from kiwipiepy import Kiwi
-except Exception:
-    KIWI_AVAILABLE = False
-
-BM25_AVAILABLE = True
-try:
-    from langchain_community.retrievers import BM25Retriever
-except Exception:
-    BM25_AVAILABLE = False
-
-ENSEMBLE_AVAILABLE = True
-try:
-    from langchain.retrievers import EnsembleRetriever
-except Exception:
-    ENSEMBLE_AVAILABLE = False
+# 8. HuggingFace Transformers (Arctic Embedding 모델)
+from transformers import AutoTokenizer, AutoModel
 
 
-# =============================
-# FastAPI App
-# =============================
-app = FastAPI(title="Ollama RAG Demo")
+
+# 1. Path 설정
+
+UPLOAD_DIR = "data_storage"
+DB_DIR = "chroma_db"
 
 
-# =============================
-# 경로 설정
-# =============================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 벡터 DB가 디스크에 저장되는 위치
-PERSIST_DIR = os.path.join(BASE_DIR, "chroma_db")
+# 2. FastAPI Lifespan
 
-# 업로드 파일 임시 저장 위치
-TEMP_DIR = os.path.join(BASE_DIR, "temp_uploads")
-os.makedirs(TEMP_DIR, exist_ok=True)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    os.makedirs(DB_DIR, exist_ok=True)
+    print(">> Server Started")
+    yield
+    print(">> Server Shutdown")
 
 
-# =============================
-# Embedding / LLM 설정
-# =============================
-# 문서와 질문을 벡터로 변환하는 임베딩 모델
-embedding = HuggingFaceEmbeddings(
-    model_name="intfloat/multilingual-e5-large-instruct",
-    encode_kwargs={"normalize_embeddings": True},
+app = FastAPI(
+    title="Tajikistan RAG API (Arctic Embed + Gemma2)",
+    lifespan=lifespan
 )
 
-# Ollama로 로컬 LLM 호출
-llm = Ollama(model="gemma2:2b")
 
 
-# =============================
-# Chroma Vector DB 로딩
-# =============================
+# 3. Device 자동 선택
+
+if torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+elif torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+else:
+    DEVICE = torch.device("cpu")
+
+print(f">> Embedding device: {DEVICE}")
+
+
+
+# 4. Snowflake Arctic Embedding (Custom Embeddings)
+
+class ArcticEmbedEmbeddings(Embeddings):
+    def __init__(
+        self,
+        model_name: str = "Snowflake/snowflake-arctic-embed-l",
+        device: torch.device = DEVICE,
+        batch_size: int = 8,
+        max_length: int = 512,
+    ):
+        self.device = device
+        self.batch_size = batch_size
+        self.max_length = max_length
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            trust_remote_code=True
+        )
+
+        self.model = AutoModel.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            torch_dtype=torch.float32  # MPS 안정화
+        ).to(self.device)
+
+        self.model.eval()
+
+    @staticmethod
+    def _mean_pool(last_hidden_state, attention_mask):
+        mask = attention_mask.unsqueeze(-1).float()
+        summed = (last_hidden_state * mask).sum(dim=1)
+        counts = mask.sum(dim=1).clamp(min=1e-9)
+        return summed / counts
+
+    @torch.no_grad()
+    def _embed_batch(self, texts: List[str]) -> List[List[float]]:
+        inputs = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt"
+        )
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        outputs = self.model(**inputs)
+        pooled = self._mean_pool(outputs.last_hidden_state, inputs["attention_mask"])
+        pooled = F.normalize(pooled, p=2, dim=1)
+
+        return pooled.cpu().tolist()
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        vectors: List[List[float]] = []
+        for i in range(0, len(texts), self.batch_size):
+            vectors.extend(self._embed_batch(texts[i:i + self.batch_size]))
+        return vectors
+
+    def embed_query(self, text: str) -> List[float]:
+        return self._embed_batch([text])[0]
+
+
+
+# 5. LLM / Embedding init
+
+llm = ChatOllama(
+    model="gemma2:2b",
+    temperature=0.2
+)
+
+embedding_model = ArcticEmbedEmbeddings()
+
+
+
+# 6. Prompt Template
+
+PROMPT_TEMPLATE = """
+You are a helpful travel assistant for tourists interested in visiting Tajikistan.
+
+Use ONLY the information provided in [Context].
+
+Guidelines:
+1. Answer as if you are helping a traveler understand the destination,
+   not as if you are analyzing or describing a document.
+2. Do not mention documents, reports, figures, pages, or sources explicitly.
+3. Avoid generic or textbook-style explanations.
+4. Focus on practical, concrete information that would be useful to travelers,
+   such as real examples, regions, activities, projects, or situations
+   mentioned in the context.
+5. If the question asks about problems or challenges, explain them in a way
+   that helps travelers understand what to expect.
+6. Do not infer or add information that is not clearly supported by the context.
+7. Answer in the same language as the question.
+8. Write in clear, natural sentences suitable for a travel guide or tourism app.
+
+[Context]:
+{context}
+
+[Question]:
+{question}
+
+[Answer]:
+
+
+"""
+
+
+prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
+
+
+
+# 7. Vector Store (ChromaDB)
+
 def get_vectorstore() -> Chroma:
-    """
-    - chroma_db 폴더가 있으면 기존 DB를 그대로 사용
-    - 서버 재시작해도 문서가 유지됨
-    """
     return Chroma(
-        persist_directory=PERSIST_DIR,
-        embedding_function=embedding,
+        persist_directory=DB_DIR,
+        embedding_function=embedding_model,
+        collection_metadata={"hnsw:space": "cosine"},
     )
 
 
-# =============================
-# 요청 바디 모델
-# =============================
-class Question(BaseModel):
+
+# 8. API Models
+
+class SourceInfo(BaseModel):
+    file: str
+    page: Optional[int] = None
+    snippet: str
+
+
+class ChatRequest(BaseModel):
     question: str
 
 
-# =============================
-# Prompt Template
-# =============================
-prompt = PromptTemplate(
-    input_variables=["context", "question"],
-    template="""
-Using the context below, answer the user's question.
-Use only the information from the context.
-If the answer is not in the context, say:
-"The document does not contain information about this topic."
-
-Context:
-{context}
-
-Question:
-{question}
-
-Answer:
-"""
-)
+class ChatResponse(BaseModel):
+    answer: str
+    time_taken: float
+    sources: List[SourceInfo]
 
 
-# =============================
-# 텍스트 전처리
-# =============================
+
+# 9. Utils
+
 def preprocess_text(text: str) -> str:
-    """
-    - 문서에서 불필요한 공백 제거
-    - 노이즈 단어 간단 정리
-    """
-    text = text.replace("ft", "처")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def preprocess_documents(docs: List[Document]) -> List[Document]:
-    """
-    - loader가 읽어온 모든 문서에 전처리 적용
-    """
+def split_semantic_then_fallback(docs: List[Document]) -> List[Document]:
+    try:
+        return SemanticChunker(
+            embedding=embedding_model,
+            breakpoint_threshold_type="percentile",
+            breakpoint_threshold_amount=90,
+        ).split_documents(docs)
+    except Exception:
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=50
+        )
+        return splitter.split_documents(docs)
+
+
+def is_russian(text: str) -> bool:
+    return any("\u0400" <= c <= "\u04FF" for c in text)
+
+
+
+# 10. Ingest API
+
+@app.post("/ingest")
+async def ingest_document(file: UploadFile = File(...)):
+    doc_id = str(uuid.uuid4())
+    save_path = os.path.join(UPLOAD_DIR, f"{doc_id}_{file.filename}")
+
+    with open(save_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    filename_lower = file.filename.lower()
+
+    if filename_lower.endswith(".pdf"):
+        loader = PyMuPDFLoader(save_path)
+    elif filename_lower.endswith(".txt"):
+        loader = TextLoader(save_path, encoding="utf-8")
+    else:
+        raise HTTPException(status_code=400, detail="Only pdf or txt supported")
+
+    docs = loader.load()
+    if not docs:
+        raise HTTPException(status_code=400, detail="No content extracted from file")
+
     for d in docs:
         d.page_content = preprocess_text(d.page_content)
-    return docs
 
+    chunks = split_semantic_then_fallback(docs)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="Chunking produced no chunks")
 
-# =============================
-# 문서 청킹
-# =============================
-def split_documents_semantic_first(
-    docs: List[Document],
-    use_semantic: bool = True,
-    chunk_size_fallback: int = 500,
-    chunk_overlap_fallback: int = 50,
-) -> List[Document]:
-    """
-    문서를 LLM이 처리 가능한 크기의 chunk로 분할
-    1) SemanticChunker 가능하면 의미 단위 분할
-    2) 아니면 일반 문자 기반 분할
-    """
-    if use_semantic and SEMANTIC_CHUNK_AVAILABLE:
-        try:
-            return SemanticChunker(embedding).split_documents(docs)
-        except Exception:
-            pass
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size_fallback,
-        chunk_overlap=chunk_overlap_fallback,
-    )
-    return splitter.split_documents(docs)
-
-
-# =============================
-# BM25 Retriever 생성
-# =============================
-def build_bm25_retriever_from_chroma(vectordb: Chroma, k: int = 3):
-    """
-    - Chroma에 저장된 문서를 기반으로 키워드 검색(BM25) 인덱스 생성
-    - 벡터 검색의 약점을 보완하기 위한 용도
-    """
-    if not BM25_AVAILABLE:
-        return None
-
-    data = vectordb._collection.get(include=["documents", "metadatas"])
-    docs = []
-
-    for text, meta in zip(data.get("documents", []), data.get("metadatas", [])):
-        if text:
-            docs.append(Document(page_content=text, metadata=meta or {}))
-
-    if not docs:
-        return None
-
-    if KIWI_AVAILABLE:
-        kiwi = Kiwi()
-        preprocess_func = lambda t: [x.form for x in kiwi.tokenize(t)]
-    else:
-        preprocess_func = lambda t: t.split()
-
-    bm25 = BM25Retriever.from_documents(docs, preprocess_func=preprocess_func)
-    bm25.k = k
-    return bm25
-
-
-# =============================
-# 파일 업로드 API
-# =============================
-@app.post("/upload_file")
-async def upload_file(file: UploadFile = File(...)):
-    """
-    흐름:
-    1) 파일 임시 저장
-    2) PDF/TXT 로더로 문서 읽기
-    3) 전처리
-    4) 청킹
-    5) Chroma DB에 벡터로 저장
-    """
-
-    temp_path = os.path.join(TEMP_DIR, f"{uuid.uuid4()}_{file.filename}")
-
-    with open(temp_path, "wb") as f:
-        f.write(await file.read())
-
-    if file.filename.endswith(".pdf"):
-        loader = PyMuPDFLoader(temp_path)
-    elif file.filename.endswith(".txt"):
-        loader = TextLoader(temp_path, encoding="utf-8")
-    else:
-        raise HTTPException(status_code=400, detail="Only pdf or txt allowed")
-
-    docs = preprocess_documents(loader.load())
-    chunks = split_documents_semantic_first(docs)
-
-    doc_id = str(uuid.uuid4())
     for i, d in enumerate(chunks):
-        d.metadata["doc_id"] = doc_id
-        d.metadata["source"] = file.filename
-        d.metadata["chunk_index"] = i
+        d.metadata.update({
+            "doc_id": doc_id,
+            "source": file.filename,
+            "chunk_index": i,
+            "page": d.metadata.get("page")
+        })
 
     vectordb = get_vectorstore()
     vectordb.add_documents(chunks)
-    vectordb.persist()
-
-    os.remove(temp_path)
+    # ✅ langchain_chroma.Chroma에는 persist() 없음 → 호출 제거
 
     return {
-        "status": "ok",
-        "filename": file.filename,
-        "chunks": len(chunks),
-        "doc_id": doc_id,
+        "message": f"Ingested {len(chunks)} chunks",
+        "doc_id": doc_id
     }
 
 
-# =============================
-# 질문 API (RAG) 
-# =============================
-@app.post("/ask")
-async def ask_question(item: Question):
-    """
-    전체 RAG 흐름:
-    질문 →
-    (Vector 검색 + BM25 검색) →
-    관련 문서 context 수집 →
-    LLM 답변 생성
-    """
 
+# 11. Chat API (RAG)
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(req: ChatRequest):
+    start = time.time()
     vectordb = get_vectorstore()
 
-    # Vector 기반 검색 , 의미는 잘 잡지만 근거가 흐릴 수 있음
     vector_retriever = vectordb.as_retriever(search_kwargs={"k": 3})
 
-    # BM25 기반 검색, 근거는 정확하지만 표현 변화에 약함
-    bm25_retriever = build_bm25_retriever_from_chroma(vectordb, k=3)
+    raw = vectordb._collection.get(include=["documents", "metadatas"])
+    bm25_docs = [
+        Document(page_content=t, metadata=m or {})
+        for t, m in zip(raw.get("documents", []), raw.get("metadatas", []))
+        if t
+    ]
 
-    # 두 검색 결과를 앙상블로 결합
     retriever = vector_retriever
-    if bm25_retriever and ENSEMBLE_AVAILABLE:
+    if bm25_docs:
+        bm25 = BM25Retriever.from_documents(bm25_docs)
+        bm25.k = 3
         retriever = EnsembleRetriever(
-            retrievers=[bm25_retriever, vector_retriever],
-            weights=[0.6, 0.4],
+            retrievers=[vector_retriever, bm25],
+            weights=[0.7, 0.3]
         )
 
-    chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        retriever=retriever,
-        chain_type_kwargs={"prompt": prompt},
-        return_source_documents=True,
+    docs = retriever.invoke(req.question)
+
+    if not docs:
+        answer = (
+            "У меня нет информации об этом в моих документах."
+            if is_russian(req.question)
+            else "I don't have information about that in my documents."
+        )
+        return ChatResponse(answer=answer, time_taken=time.time() - start, sources=[])
+
+    context = "\n\n---\n\n".join(d.page_content for d in docs)
+    sources = [
+        SourceInfo(
+            file=d.metadata.get("source", "unknown"),
+            page=d.metadata.get("page"),
+            snippet=d.page_content[:300]
+        )
+        for d in docs
+    ]
+
+    chain = prompt | llm | StrOutputParser()
+    answer = chain.invoke({"context": context, "question": req.question})
+
+    return ChatResponse(
+        answer=answer,
+        time_taken=time.time() - start,
+        sources=sources
     )
 
-    # 응답 시간 측정
-    start = time.time()
-    result = chain.invoke({"query": item.question})
-    elapsed = round(time.time() - start, 3)
-
-    return {
-        "question": item.question,
-        "answer": result["result"],
-        "elapsed_time_sec": elapsed,
-        "sources": [
-            {
-                "source": d.metadata.get("source"),
-                "page": d.metadata.get("page", -1),
-                "chunk_index": d.metadata.get("chunk_index"),
-                "doc_id": d.metadata.get("doc_id"),
-            }
-            for d in result["source_documents"]
-        ],
-    }
 
 
-# =============================
-# 문서 목록 조회
-# =============================
-@app.get("/list_documents")
+# 12. List Documents API
+
+@app.get("/documents")
 async def list_documents():
-    """
-    - DB에 들어있는 문서(doc_id 기준) 목록 확인
-    """
     vectordb = get_vectorstore()
     data = vectordb._collection.get(include=["metadatas"])
 
-    docs: Dict[str, str] = {}
-    for m in data["metadatas"]:
-        docs[m["doc_id"]] = m["source"]
+    documents: Dict[str, str] = {}
+    for meta in data.get("metadatas", []):
+        if meta and "doc_id" in meta and "source" in meta:
+            documents[meta["doc_id"]] = meta["source"]
 
-    return {"documents": docs}
+    return {"documents": documents}
 
 
-# =============================
-# 문서 삭제
-# =============================
-@app.delete("/delete_document")
+
+# 13. Delete Document API
+
+@app.delete("/documents/{doc_id}")
 async def delete_document(doc_id: str):
-    """
-    - 특정 문서(doc_id)에 해당하는 모든 chunk 삭제
-    """
     vectordb = get_vectorstore()
     data = vectordb._collection.get(where={"doc_id": doc_id})
+    ids = data.get("ids", [])
 
-    vectordb._collection.delete(data["ids"])
-    return {"deleted_chunks": len(data["ids"])}
+    if not ids:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    vectordb._collection.delete(ids=ids)
+
+    return {"deleted_chunks": len(ids), "doc_id": doc_id}
 
 
-# =============================
-# 전체 초기화
-# =============================
-@app.delete("/clear_all")
-async def clear_all():
+
+# 14. Clear All Documents API
+
+@app.delete("/documents")
+async def clear_all_documents():
     """
-    - chroma_db 폴더 삭제 → 모든 문서/임베딩 제거
+    Vector DB 전체 초기화 + 업로드 파일 삭제
+    (폴더 삭제 방식: 래퍼/버전 상관없이 가장 확실)
     """
-    if os.path.exists(PERSIST_DIR):
-        shutil.rmtree(PERSIST_DIR)
-    return {"status": "ok"}
+    try:
+        if os.path.exists(DB_DIR):
+            shutil.rmtree(DB_DIR)
+        os.makedirs(DB_DIR, exist_ok=True)
+
+        if os.path.exists(UPLOAD_DIR):
+            shutil.rmtree(UPLOAD_DIR)
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+        return {"message": "All documents cleared (DB + uploads)."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+# 15. Run
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
