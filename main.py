@@ -155,20 +155,21 @@ PROMPT_TEMPLATE = """
 You are a travel assistant using retrieved documents.
 
 Rules:
-- Base your answer ONLY on the information in the Context.
-- You MAY combine multiple related facts from the Context
-  to provide a clearer explanation.
-- Do NOT add facts that are not present in the Context.
-- Do NOT speculate.
+- Answer ONLY using information explicitly stated in the Context.
+- Do NOT infer, speculate, or use general travel knowledge.
+- If information is not mentioned in the Context, omit it silently.
 
-Write 3–5 sentences in a natural explanatory tone.
-Avoid general tourism or promotional language.
-Use factual descriptions grounded in the Context.
-Use neutral, report-style language and avoid promotional or descriptive adjectives not explicitly stated in the Context.
-Do not state direct outcomes or impacts unless they are explicitly mentioned in the Context.
-Use cautious expressions such as "can", "is considered", or "has potential".
-If the question is about how to reach a place,
-describe the route and travel conditions ONLY if they are mentioned in the context
+Task:
+- Select 3–4 DISTINCT tourist attractions explicitly mentioned in the Context.
+- Write EACH attraction as a SEPARATE section.
+- Do NOT group multiple attractions together.
+
+Output format:
+For each attraction, use EXACTLY this structure:
+
+Writing style:
+- Neutral, report-style language.
+- No promotional wording.
 
 [Context]:
 {context}
@@ -327,43 +328,72 @@ async def chat(req: ChatRequest):
     language = "Russian" if is_russian(req.question) else "English"
     category = detect_question_category(req.question)
 
-    # if category is None:
-    #     msg = (
-    #         "Эта функция не поддерживается в версии 1.0."
-    #         if language == "Russian"
-    #         else "This question is not supported in version 1.0."
-    #     )
-    #     return ChatResponse(answer=msg, time_taken=time.time() - start, sources=[])
+    # -------------------------
+    # 1. Vector search (with score)
+    # -------------------------
+    vector_filter = {"category": category} if category else None
 
-    search_kwargs = {"k": 3}
-    if category:
-        search_kwargs["filter"] = {"category": category}
-
-    vector_retriever = vectordb.as_retriever(
-        search_kwargs=search_kwargs
+    vector_results = vectordb.similarity_search_with_score(
+        req.question,
+        k=3,
+        filter=vector_filter
     )
+    # score: cosine distance (낮을수록 좋음)
 
+    vector_docs = {}
+    for doc, score in vector_results:
+        if is_garbled(doc.page_content) or is_low_value(doc.page_content):
+            continue
+        vector_docs[(doc.page_content, doc.metadata.get("chunk_index"))] = {
+            "doc": doc,
+            "score": score,          # 그대로 사용
+            "source": "vector"
+        }
+
+    # -------------------------
+    # 2. BM25 search (rank-based score)
+    # -------------------------
     raw = vectordb._collection.get(include=["documents", "metadatas"])
-    bm25_docs = [
+    bm25_corpus = [
         Document(page_content=t, metadata=m)
         for t, m in zip(raw["documents"], raw["metadatas"])
         if (category is None or m.get("category") == category)
     ]
 
-    retriever = vector_retriever
-    if bm25_docs:
-        bm25 = BM25Retriever.from_documents(bm25_docs)
+    bm25_docs = {}
+    if bm25_corpus:
+        bm25 = BM25Retriever.from_documents(bm25_corpus)
         bm25.k = 3
-        retriever = EnsembleRetriever(
-            retrievers=[vector_retriever, bm25],
-            weights=[0.7, 0.3]
-        )
+        bm25_results = bm25.get_relevant_documents(req.question)
 
-    docs = [
-        d for d in retriever.invoke(req.question)
-        if not is_garbled(d.page_content) and not is_low_value(d.page_content)
-    ]
+        for rank, doc in enumerate(bm25_results):
+            if is_garbled(doc.page_content) or is_low_value(doc.page_content):
+                continue
 
+            key = (doc.page_content, doc.metadata.get("chunk_index"))
+
+            # rank → pseudo-score (낮을수록 좋음)
+            bm25_score = rank + 1
+
+            if key in vector_docs:
+                # vector + bm25 둘 다 hit → 보너스
+                vector_docs[key]["score"] *= 0.7
+            else:
+                vector_docs[key] = {
+                    "doc": doc,
+                    "score": bm25_score + 1.5,  # vector보다 약간 불리
+                    "source": "bm25"
+                }
+
+    # -------------------------
+    # 3. Final ranking (score ASC)
+    # -------------------------
+    ranked = sorted(vector_docs.values(), key=lambda x: x["score"])
+    docs = [r["doc"] for r in ranked][:4]  # LLM에 3~4개만 제공
+
+    # -------------------------
+    # 4. No result handling
+    # -------------------------
     if not docs:
         msg = (
             "В предоставленных документах нет информации."
@@ -372,15 +402,20 @@ async def chat(req: ChatRequest):
         )
         return ChatResponse(answer=msg, time_taken=time.time() - start, sources=[])
 
+    # -------------------------
+    # 5. LLM
+    # -------------------------
     context = "\n\n---\n\n".join(d.page_content for d in docs)
     chain = prompt | llm | StrOutputParser()
 
     answer = chain.invoke({
         "context": context,
-        "question": req.question,
-        "language": language
+        "question": req.question
     })
 
+    # -------------------------
+    # 6. Sources
+    # -------------------------
     sources = [
         SourceInfo(
             file=d.metadata.get("source", "unknown"),
@@ -390,7 +425,11 @@ async def chat(req: ChatRequest):
         for d in docs
     ]
 
-    return ChatResponse(answer=answer, time_taken=time.time() - start, sources=sources)
+    return ChatResponse(
+        answer=answer,
+        time_taken=time.time() - start,
+        sources=sources
+    )
 
 @app.get("/documents")
 async def list_documents():
