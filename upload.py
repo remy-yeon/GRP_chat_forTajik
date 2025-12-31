@@ -74,7 +74,7 @@ print(f"임베딩 디바이스: {DEVICE}")
 class ArcticEmbedEmbeddings(Embeddings):
     def __init__(
         self,
-        model_name: str = "Snowflake/snowflake-arctic-embed-m-v2.0",
+        model_name: str = "Snowflake/snowflake-arctic-embed-l",
         device: torch.device = DEVICE,
         batch_size: int = 8,
         max_length: int = 512,

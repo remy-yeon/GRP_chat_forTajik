@@ -15,7 +15,7 @@ import torch.nn.functional as F
 # 2. FastAPI & Pydantic
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 # 3. LangChain Core
@@ -87,6 +87,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# 전역 예외 핸들러 - 500 에러 대신 상세 메시지 반환
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    import traceback
+    error_detail = str(exc)
+    error_type = type(exc).__name__
+    print(f"[ERROR] {error_type}: {error_detail}")
+    traceback.print_exc()
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": error_type,
+            "detail": error_detail,
+            "message": "서버 내부 오류가 발생했습니다. 관리자에게 문의하세요."
+        }
+    )
 
 
 @app.get("/")
@@ -339,14 +357,33 @@ async def chat(req: ChatRequest):
     start = time.time()
     vectordb = get_vectorstore()
 
+    # 빈 DB 체크
+    try:
+        doc_count = vectordb._collection.count()
+    except Exception:
+        doc_count = 0
+
+    if doc_count == 0:
+        answer = (
+            "У меня нет загруженных документов. Пожалуйста, сначала загрузите документы."
+            if is_russian(req.question)
+            else "No documents uploaded yet. Please upload documents first."
+        )
+        return ChatResponse(answer=answer, time_taken=time.time() - start, sources=[])
+
     vector_retriever = vectordb.as_retriever(search_kwargs={"k": 3})
 
-    raw = vectordb._collection.get(include=["documents", "metadatas"])
-    bm25_docs = [
-        Document(page_content=t, metadata=m or {})
-        for t, m in zip(raw.get("documents", []), raw.get("metadatas", []))
-        if t
-    ]
+    # BM25 문서 로드 (예외 처리 추가)
+    bm25_docs = []
+    try:
+        raw = vectordb._collection.get(include=["documents", "metadatas"])
+        bm25_docs = [
+            Document(page_content=t, metadata=m or {})
+            for t, m in zip(raw.get("documents", []), raw.get("metadatas", []))
+            if t
+        ]
+    except Exception:
+        pass
 
     retriever = vector_retriever
     if bm25_docs:
