@@ -11,9 +11,10 @@ pymupdf
 langchain
 langchain-community
 langchain-experimental
+langchain-text-splitters
 
 # 벡터 DB & 임베딩
-chromadb
+chromadb==1.4.0
 sentence-transformers
 
 # 한국어 처리 & 검색 개선

@@ -389,6 +389,74 @@
             border: 1px solid rgba(231, 76, 60, 0.3);
             color: #E74C3C;
         }
+
+        /* ----- 토글형 출처 섹션 ----- */
+        .sources-header {
+            cursor: pointer;
+            user-select: none;
+            transition: color 0.2s;
+        }
+
+        .sources-header:hover {
+            color: var(--text-primary);
+        }
+
+        .sources-toggle {
+            font-size: 10px;
+            margin-right: 4px;
+            transition: transform 0.2s;
+            display: inline-block;
+        }
+
+        .sources-section.expanded .sources-toggle {
+            transform: rotate(90deg);
+        }
+
+        .sources-list {
+            display: none;
+            max-height: 0;
+            overflow: hidden;
+            transition: max-height 0.3s ease-out;
+        }
+
+        .sources-section.expanded .sources-list {
+            display: flex;
+            max-height: 1000px;
+        }
+
+        /* ----- 출처 아이템 (snippet 포함) ----- */
+        .source-item {
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 8px;
+            width: 100%;
+            max-width: 100%;
+        }
+
+        .source-item-header {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            width: 100%;
+        }
+
+        .source-snippet {
+            font-size: 12px;
+            color: var(--text-secondary);
+            line-height: 1.5;
+            padding: 8px 10px;
+            background-color: rgba(0, 0, 0, 0.2);
+            border-radius: 4px;
+            width: 100%;
+            white-space: pre-wrap;
+            word-break: break-word;
+            max-height: 80px;
+            overflow-y: auto;
+        }
+
+        .sources-list {
+            flex-direction: column;
+        }
     </style>
 </head>
 <body>
@@ -475,28 +543,36 @@
             return messageDiv;
         }
 
-        // 출처 렌더링 함수
+        // 출처 렌더링 함수 (토글 형식 + snippet 포함)
         function renderSources(sources) {
             if (!sources || sources.length === 0) return '';
 
-            const sourceItems = sources.map(source => {
+            const sourceItems = sources.map((source, index) => {
                 const filename = typeof source.source === 'string'
                     ? source.source
                     : (typeof source.file === 'string' ? source.file : 'unknown');
                 const icon = filename.toLowerCase().endsWith('.pdf') ? '📕' : '📄';
                 const pageInfo = source.page ? `<span class="source-page">p.${source.page}</span>` : '';
+                const snippet = source.snippet ? escapeHtml(source.snippet) : '';
 
                 return `
                     <div class="source-item">
-                        <span class="source-file">${icon} ${escapeHtml(filename)}</span>
-                        ${pageInfo}
+                        <div class="source-item-header">
+                            <span class="source-file">${icon} ${escapeHtml(filename)}</span>
+                            ${pageInfo}
+                        </div>
+                        ${snippet ? `<div class="source-snippet">${snippet}</div>` : ''}
                     </div>
                 `;
             }).join('');
 
+            // 고유 ID 생성
+            const sectionId = 'sources-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
+
             return `
-                <div class="sources-section">
-                    <div class="sources-header">
+                <div class="sources-section" id="${sectionId}">
+                    <div class="sources-header" onclick="toggleSources('${sectionId}')">
+                        <span class="sources-toggle">▶</span>
                         <span class="sources-icon">📚</span>
                         <span class="sources-title">참조 문서 (${sources.length})</span>
                     </div>
@@ -505,6 +581,14 @@
                     </div>
                 </div>
             `;
+        }
+
+        // 출처 섹션 토글 함수
+        function toggleSources(sectionId) {
+            const section = document.getElementById(sectionId);
+            if (section) {
+                section.classList.toggle('expanded');
+            }
         }
 
         // 텍스트 영역 자동 크기 조절

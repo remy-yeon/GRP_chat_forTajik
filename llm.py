@@ -113,7 +113,7 @@ print(f">> Embedding device: {DEVICE}")
 class ArcticEmbedEmbeddings(Embeddings):
     def __init__(
         self,
-        model_name: str = "Snowflake/snowflake-arctic-embed-m-v2.0",
+        model_name: str = "Snowflake/snowflake-arctic-embed-l",
         device: torch.device = DEVICE,
         batch_size: int = 8,
         max_length: int = 512,
@@ -449,4 +449,4 @@ async def clear_all_documents():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("llm:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("llm:app", host="0.0.0.0", port=8000, reload=False)
