@@ -1,86 +1,126 @@
+"""
+main.py - Single-file RAG API (Ollama Embeddings + Chroma + Hybrid Retriever)
+
+Stack:
+- Chunking: SemanticChunker (fallback: RecursiveCharacterTextSplitter)
+- Vector DB: Chroma (persist_directory)
+- Embedding: OllamaEmbeddings("snowflake-arctic-embed2")
+- LLM: ChatOllama("gemma2:2b")
+- Hybrid Retrieval: Dense(MMR) + Sparse(BM25) merged by RRF
+- Performance: VectorDB + BM25 cached in app.state, BM25 rebuilt only on ingest/delete/clear
+"""
+
 from __future__ import annotations
 
 import os
-import json
-import time
+import re
 import shutil
+import time
+import uuid
 import asyncio
-import hashlib
-from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
-from contextlib import asynccontextmanager
 
-# Loaders
-from langchain_community.document_loaders import PyMuPDFLoader, TextLoader
-
-# Docs / splitters
 from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-# Semantic chunker (experimental)
-from langchain_experimental.text_splitter import SemanticChunker
-
-# Vector stores
-from langchain_chroma import Chroma
-from langchain_community.vectorstores import FAISS
-
-# Retrievers
-try:
-    from langchain_community.retrievers import BM25Retriever
-except Exception:
-    from langchain.retrievers import BM25Retriever  # type: ignore
-
-# Ollama (newer)
-try:
-    from langchain_ollama import ChatOllama, OllamaEmbeddings
-except Exception:
-    # fallback (older)
-    from langchain_community.chat_models import ChatOllama  # type: ignore
-    from langchain_community.embeddings import OllamaEmbeddings  # type: ignore
-
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
+from langchain_community.document_loaders import PyMuPDFLoader, TextLoader
+from langchain_experimental.text_splitter import SemanticChunker
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# -----------------------------
-# 1) Settings
-# -----------------------------
-BASE_DIR = Path(__file__).parent.resolve()
+from langchain_chroma import Chroma
+from langchain_community.retrievers import BM25Retriever
 
-UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(BASE_DIR / "data_storage")))
-CHROMA_DIR = Path(os.getenv("CHROMA_DIR", str(BASE_DIR / "chroma_db")))
-FAISS_DIR = Path(os.getenv("FAISS_DIR", str(BASE_DIR / "faiss_index")))
-INDEX_DIR = Path(os.getenv("INDEX_DIR", str(BASE_DIR / "index")))
-CHUNKS_PATH = INDEX_DIR / "chunks.jsonl"
-
-CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "rag_docs")
-
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "snowflake-arctic-embed2")
-LLM_MODEL = os.getenv("LLM_MODEL", "gemma2:2b")
-
-# retrieval knobs
-TOP_K_BM25 = int(os.getenv("TOP_K_BM25", "8"))
-TOP_K_FAISS = int(os.getenv("TOP_K_FAISS", "8"))
-TOP_K_ENSEMBLE = int(os.getenv("TOP_K_ENSEMBLE", "6"))
-W_BM25 = float(os.getenv("W_BM25", "0.45"))
-W_FAISS = float(os.getenv("W_FAISS", "0.55"))
-
-# chunk knobs
-COARSE_CHUNK_SIZE = int(os.getenv("COARSE_CHUNK_SIZE", "2000"))
-COARSE_CHUNK_OVERLAP = int(os.getenv("COARSE_CHUNK_OVERLAP", "200"))
-SEMANTIC_THRESHOLD_TYPE = os.getenv("SEMANTIC_THRESHOLD_TYPE", "percentile")
-
-# context limit (Gemma 2B 대비)
-MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "12000"))
+from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_community.vectorstores.utils import filter_complex_metadata
 
 
-# -----------------------------
-# 2) API Models
-# -----------------------------
+# =========================
+# 1) Path 설정
+# =========================
+UPLOAD_DIR = "data_storage"
+DB_DIR = "chroma_db"
+
+
+# =========================
+# 2) Retrieval 튜닝 파라미터
+# =========================
+# Dense 검색(MMR)
+K_DENSE = 8               # 최종 dense 반환 개수
+FETCH_K = 40              # MMR이 후보로 더 많이 뽑아 다양성 고려
+LAMBDA_MULT = 0.35        # 1에 가까울수록 유사성, 0에 가까울수록 다양성
+
+# Sparse 검색(BM25)
+K_SPARSE = 8
+
+# Hybrid merge
+K_FINAL = 4               # LLM에 넣을 최종 문서 개수
+RRF_K = 60                # RRF 안정 상수(크면 랭크 차이 완만)
+
+# Context 길이 제한(너무 길면 속도/품질 흔들림 방지)
+MAX_CONTEXT_CHARS = 6500
+
+
+# =========================
+# 3) Prompt
+# =========================
+PROMPT_TEMPLATE = """
+You are a helpful travel assistant for tourists interested in visiting Tajikistan.
+
+Use ONLY the information provided in [Context].
+
+Guidelines:
+1. Answer as if you are helping a traveler understand the destination,
+   not as if you are analyzing or describing a document.
+2. Do not mention documents, reports, figures, pages, or sources explicitly.
+3. Avoid generic or textbook-style explanations.
+4. Focus on practical, concrete information that would be useful to travelers,
+   such as real examples, regions, activities, projects, or situations
+   mentioned in the context.
+5. If the question asks about problems or challenges, explain them in a way
+   that helps travelers understand what to expect.
+6. Do not infer or add information that is not clearly supported by the context.
+7. Answer in the same language as the question.
+8. Write in clear, natural sentences suitable for a travel guide or tourism app.
+
+[Context]:
+{context}
+
+[Question]:
+{question}
+
+[Answer]:
+""".strip()
+
+prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
+
+
+# =========================
+# 4) LLM / Embedding (Ollama)
+# =========================
+# 필요하면 base_url="http://127.0.0.1:11434" 명시 가능
+llm = ChatOllama(model="gemma2:2b", temperature=0.2)
+embedding_model = OllamaEmbeddings(model="snowflake-arctic-embed2")
+
+
+# =========================
+# 5) Vector Store
+# =========================
+def get_vectorstore() -> Chroma:
+    return Chroma(
+        persist_directory=DB_DIR,
+        embedding_function=embedding_model,
+        collection_metadata={"hnsw:space": "cosine"},
+    )
+
+
+# =========================
+# 6) API Models
+# =========================
 class SourceInfo(BaseModel):
     file: str
     page: Optional[int] = None
@@ -97,367 +137,348 @@ class ChatResponse(BaseModel):
     sources: List[SourceInfo]
 
 
-# -----------------------------
-# 3) Helpers
-# -----------------------------
-def _ensure_dirs() -> None:
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-    FAISS_DIR.mkdir(parents=True, exist_ok=True)
-    INDEX_DIR.mkdir(parents=True, exist_ok=True)
+# =========================
+# 7) Utils
+# =========================
+def preprocess_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def _is_supported(filename: str) -> bool:
-    fn = filename.lower()
-    return fn.endswith(".pdf") or fn.endswith(".txt") or fn.endswith(".md")
+def is_russian(text: str) -> bool:
+    return any("\u0400" <= c <= "\u04FF" for c in text)
 
 
-def _load_file_as_docs(file_path: Path) -> List[Document]:
-    lower = file_path.name.lower()
-    if lower.endswith(".pdf"):
-        loader = PyMuPDFLoader(str(file_path))
-    elif lower.endswith(".txt") or lower.endswith(".md"):
-        loader = TextLoader(str(file_path), encoding="utf-8")
-    else:
-        raise ValueError("Only .pdf, .txt, .md are supported.")
-
-    docs = loader.load()
-    for d in docs:
-        md = dict(d.metadata or {})
-        md["source"] = str(file_path)
-        d.metadata = md
-    return docs
-
-
-def _semantic_chunk(docs: List[Document], embeddings: OllamaEmbeddings) -> List[Document]:
-    coarse_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=COARSE_CHUNK_SIZE,
-        chunk_overlap=COARSE_CHUNK_OVERLAP,
-    )
-    coarse_docs = coarse_splitter.split_documents(docs)
-
-    semantic_splitter = SemanticChunker(
-        embeddings,
-        breakpoint_threshold_type=SEMANTIC_THRESHOLD_TYPE,
-    )
-    sem_docs = semantic_splitter.split_documents(coarse_docs)
-    return [d for d in sem_docs if d.page_content and d.page_content.strip()]
+def sanitize_metadata(meta: dict) -> dict:
+    """
+    Chroma metadata는 str/int/float/bool만 허용.
+    None/리스트/딕셔너리 등은 제거 또는 문자열화.
+    """
+    clean = {}
+    for k, v in (meta or {}).items():
+        if v is None:
+            continue
+        if isinstance(v, (str, int, float, bool)):
+            clean[k] = v
+        else:
+            clean[k] = str(v)
+    return clean
 
 
-def _append_chunks_jsonl(chunks: List[Document]) -> int:
-    new_lines = 0
-    with CHUNKS_PATH.open("a", encoding="utf-8") as f:
-        for d in chunks:
-            md = {}
-            for k, v in (d.metadata or {}).items():
-                try:
-                    json.dumps(v)
-                    md[k] = v
-                except Exception:
-                    md[k] = str(v)
-            f.write(json.dumps({"page_content": d.page_content, "metadata": md}, ensure_ascii=False) + "\n")
-            new_lines += 1
-    return new_lines
+def split_semantic_then_fallback(docs: List[Document]) -> List[Document]:
+    """
+    SemanticChunker는 embedding이 필요합니다.
+    OllamaEmbeddings로도 동작하며, 실패 시 안전하게 char splitter로 fallback.
+    """
+    try:
+        return SemanticChunker(
+            embedding=embedding_model,
+            breakpoint_threshold_type="percentile",
+            breakpoint_threshold_amount=90,
+        ).split_documents(docs)
+    except Exception:
+        splitter = RecursiveCharacterTextSplitter(chunk_size=900, chunk_overlap=120)
+        return splitter.split_documents(docs)
 
 
-def _load_all_chunks_jsonl() -> List[Document]:
-    if not CHUNKS_PATH.exists():
-        return []
-    docs: List[Document] = []
-    with CHUNKS_PATH.open("r", encoding="utf-8") as f:
-        for line in f:
-            obj = json.loads(line)
-            docs.append(Document(page_content=obj["page_content"], metadata=obj.get("metadata") or {}))
-    return docs
-
-
-def _build_bm25_retriever(all_chunks: List[Document]) -> BM25Retriever:
-    bm25 = BM25Retriever.from_documents(all_chunks)
-    bm25.k = TOP_K_BM25
-    return bm25
-
-
-def _load_faiss_if_exists(embeddings: OllamaEmbeddings) -> Optional[FAISS]:
-    if (FAISS_DIR / "index.faiss").exists() or (FAISS_DIR / "index.pkl").exists():
-        return FAISS.load_local(
-            str(FAISS_DIR),
-            embeddings,
-            allow_dangerous_deserialization=True,
-        )
-    return None
-
-
-def _save_faiss(vs: FAISS) -> None:
-    vs.save_local(str(FAISS_DIR))
-
-
-def _format_context(docs: List[Document], max_chars: int = MAX_CONTEXT_CHARS) -> str:
+def build_context(docs: List[Document], max_chars: int = MAX_CONTEXT_CHARS) -> str:
     parts = []
     total = 0
     for d in docs:
-        text = (d.page_content or "").strip()
+        text = d.page_content.strip()
         if not text:
             continue
         if total + len(text) > max_chars:
+            remain = max_chars - total
+            if remain > 200:
+                parts.append(text[:remain])
             break
         parts.append(text)
         total += len(text)
     return "\n\n---\n\n".join(parts)
 
 
-def _sources_from_docs(docs: List[Document], snippet_len: int = 300) -> List[SourceInfo]:
-    out: List[SourceInfo] = []
-    for d in docs:
-        src = d.metadata.get("source", "unknown")
-        filename = os.path.basename(str(src))
-        page = d.metadata.get("page", d.metadata.get("page_number", None))
-        snippet = (d.page_content or "")[:snippet_len]
-        out.append(SourceInfo(file=filename, page=page, snippet=snippet))
-    return out
+def doc_key(d: Document) -> str:
+    """
+    중복 제거 키: (doc_id, chunk_index, source) 우선, 없으면 내용 기반
+    """
+    m = d.metadata or {}
+    if "doc_id" in m and "chunk_index" in m and "source" in m:
+        return f'{m["doc_id"]}:{m["chunk_index"]}:{m["source"]}'
+    return (m.get("source", "unknown") + ":" + str(hash(d.page_content)))
 
 
-def _is_russian(text: str) -> bool:
-    return any("\u0400" <= ch <= "\u04FF" for ch in text)
-
-
-def _fallback_no_info(text: str) -> str:
-    if _is_russian(text):
-        return "У меня нет информации об этом в моих документах."
-    return "I don't have information about that in my documents."
-
-
-def _safe_invoke(retriever, query: str) -> List[Document]:
-    # retriever.invoke 우선, 없으면 get_relevant_documents
-    if hasattr(retriever, "invoke"):
-        return retriever.invoke(query)
-    if hasattr(retriever, "get_relevant_documents"):
-        return retriever.get_relevant_documents(query)
-    raise RuntimeError("Retriever has no invoke/get_relevant_documents method.")
-
-
-def _doc_key(d: Document) -> str:
-    src = str(d.metadata.get("source", ""))
-    page = str(d.metadata.get("page", d.metadata.get("page_number", "")))
-    content_hash = hashlib.md5((d.page_content or "").encode("utf-8", errors="ignore")).hexdigest()
-    return f"{src}|{page}|{content_hash}"
-
-
-def _rrf_fuse(
-    a: List[Document],
-    b: List[Document],
-    w_a: float,
-    w_b: float,
-    rrf_k: int = 60,
-    top_k: int = TOP_K_ENSEMBLE,
+def rrf_merge(
+    dense_docs: List[Document],
+    sparse_docs: List[Document],
+    k_final: int = K_FINAL,
+    rrf_k: int = RRF_K,
 ) -> List[Document]:
     """
-    Weighted Reciprocal Rank Fusion
-    score += weight / (rrf_k + rank)
+    Reciprocal Rank Fusion: score = Σ 1/(rrf_k + rank)
+    (rank는 1부터)
     """
-    scores = {}
-    docs_map = {}
+    scores: Dict[str, float] = {}
+    by_key: Dict[str, Document] = {}
 
-    for rank, d in enumerate(a, start=1):
-        key = _doc_key(d)
-        docs_map[key] = d
-        scores[key] = scores.get(key, 0.0) + (w_a / (rrf_k + rank))
+    def add(docs: List[Document], weight: float):
+        for rank, d in enumerate(docs, start=1):
+            key = doc_key(d)
+            by_key[key] = d
+            scores[key] = scores.get(key, 0.0) + weight * (1.0 / (rrf_k + rank))
 
-    for rank, d in enumerate(b, start=1):
-        key = _doc_key(d)
-        docs_map[key] = d
-        scores[key] = scores.get(key, 0.0) + (w_b / (rrf_k + rank))
+    # 가중치(원하면 조절): dense를 조금 더 믿는 편
+    
+#     추천 기본값(관광 챗봇 운영 관점)
+# ✅ 기본(가장 무난)
+# dense 0.45 / sparse 0.55
+# ✅ 대화형·추천형이 더 많다(“어디 가야 해?”, “분위기 좋은 곳?”, “아이랑 가기 좋나?”)
+# dense 0.6 / sparse 0.4
+# ✅ 팩트 검증/정보성 QA가 더 많다(고도, 위치, 이름, 입장, 운영 등)
+# dense 0.3~0.4 / sparse 0.6~0.7
+    
+    add(dense_docs, weight=0.3)
+    add(sparse_docs, weight=0.7)
 
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    return [docs_map[k] for k, _ in ranked[:top_k]]
-
-
-def _build_rag_chain(llm: ChatOllama):
-    """English/Russian guide persona (NO outside knowledge)."""
-    template = """
-You are an AI assistant specialized in Tajikistan tourism.
-
-You MUST follow these rules strictly:
-- Use ONLY the information provided in [Context].
-- Do NOT add any facts, names, numbers, or locations that are not explicitly stated in [Context].
-- If [Context] is empty OR the answer cannot be clearly found in [Context], you MUST say:
-  * English: "I don't have information about that in my documents."
-  * Russian: "У меня нет информации об этом в моих документах."
-- If the user asks in English, answer in English.
-- If the user asks in Russian (Cyrillic), answer in Russian.
-- Do NOT use Korean.
-- Do NOT write sentences in Tajik (proper nouns from the documents are allowed).
-- Keep your answer concise and helpful.
-
-[Context]:
-{context}
-
-[User Question]:
-{question}
-
-[Answer]:
-"""
-    prompt = ChatPromptTemplate.from_template(template)
-    return prompt | llm | StrOutputParser()
+    merged = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return [by_key[k] for k, _ in merged[:k_final]]
 
 
-# -----------------------------
-# 4) FastAPI app + lifespan
-# -----------------------------
+async def rebuild_bm25(app: FastAPI) -> None:
+    """
+    BM25는 매 요청마다 만들지 말고, 데이터 변경 때만 갱신.
+    """
+    vectordb: Chroma = app.state.vectordb
+    raw = vectordb._collection.get(include=["documents", "metadatas"])
+    docs = [
+        Document(page_content=t, metadata=(m or {}))
+        for t, m in zip(raw.get("documents", []), raw.get("metadatas", []))
+        if t and t.strip()
+    ]
+    if docs:
+        bm25 = BM25Retriever.from_documents(docs)
+        bm25.k = K_SPARSE
+        app.state.bm25 = bm25
+    else:
+        app.state.bm25 = None
+
+
+# =========================
+# 8) FastAPI Lifespan (캐시/락 준비)
+# =========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    _ensure_dirs()
-    print(">> [System] Server Started. Storage Ready.")
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    os.makedirs(DB_DIR, exist_ok=True)
 
-    embeddings = OllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_BASE_URL)
-    llm = ChatOllama(model=LLM_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.2)
+    app.state.vectordb = get_vectorstore()
+    app.state.bm25 = None
 
-    all_chunks = _load_all_chunks_jsonl()
-    bm25 = _build_bm25_retriever(all_chunks) if all_chunks else None
+    # 쓰기/리빌드 보호용 락
+    app.state.write_lock = asyncio.Lock()
+    app.state.rebuild_lock = asyncio.Lock()
 
-    chroma = Chroma(
-        collection_name=CHROMA_COLLECTION,
-        persist_directory=str(CHROMA_DIR),
-        embedding_function=embeddings,
-    )
+    # 초기 BM25 build(기존 DB 있을 때)
+    async with app.state.rebuild_lock:
+        await rebuild_bm25(app)
 
-    faiss_vs = None
-    try:
-        faiss_vs = _load_faiss_if_exists(embeddings)
-    except Exception as e:
-        print(f">> [WARN] FAISS load failed: {e}. Will create on first ingest.")
-        faiss_vs = None
-
-    app.state.lock = asyncio.Lock()
-    app.state.embeddings = embeddings
-    app.state.llm = llm
-    app.state.chain = _build_rag_chain(llm)
-
-    app.state.chroma = chroma
-    app.state.faiss_vs = faiss_vs
-    app.state.bm25_docs = all_chunks
-    app.state.bm25 = bm25
-
+    print(">> Server Started")
     yield
-    print(">> [System] Server Shutdown.")
+    print(">> Server Shutdown")
 
 
-app = FastAPI(title="RAG Chatbot API (SemanticChunk + Chroma + BM25/FAISS RRF Fusion)", lifespan=lifespan)
+app = FastAPI(
+    title="Tajikistan RAG API (Ollama Embeddings + Gemma2)",
+    lifespan=lifespan,
+)
 
 
-# -----------------------------
-# 5) Endpoints
-# -----------------------------
-@app.get("/health")
-async def health():
-    return {"ok": True}
-
-
-@app.post("/ingest", summary="Document Upload & Indexing")
+# =========================
+# 9) Ingest API
+# =========================
+@app.post("/ingest")
 async def ingest_document(file: UploadFile = File(...)):
-    if not file.filename or not _is_supported(file.filename):
-        raise HTTPException(status_code=400, detail="Only .pdf, .txt, .md files are supported.")
+    doc_id = str(uuid.uuid4())
+    save_path = os.path.join(UPLOAD_DIR, f"{doc_id}_{file.filename}")
 
-    file_path = UPLOAD_DIR / file.filename
-    try:
-        with file_path.open("wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
+    async with app.state.write_lock:
+        with open(save_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
 
-    async with app.state.lock:
-        try:
-            docs = _load_file_as_docs(file_path)
-            chunks = _semantic_chunk(docs, app.state.embeddings)
+        filename_lower = file.filename.lower()
+        if filename_lower.endswith(".pdf"):
+            loader = PyMuPDFLoader(save_path)
+        elif filename_lower.endswith(".txt"):
+            loader = TextLoader(save_path, encoding="utf-8")
+        else:
+            raise HTTPException(status_code=400, detail="Only pdf or txt supported")
 
-            if not chunks:
-                raise HTTPException(status_code=400, detail="No chunks produced. Check the document content.")
+        docs = loader.load()
+        if not docs:
+            raise HTTPException(status_code=400, detail="No content extracted from file")
 
-            # Chroma store (optional for now)
-            app.state.chroma.add_documents(chunks)
-            if hasattr(app.state.chroma, "persist"):
-                try:
-                    app.state.chroma.persist()
-                except Exception:
-                    pass
+        for d in docs:
+            d.page_content = preprocess_text(d.page_content)
 
-            # BM25 corpus
-            _append_chunks_jsonl(chunks)
-            app.state.bm25_docs.extend(chunks)
-            app.state.bm25 = _build_bm25_retriever(app.state.bm25_docs)
+        chunks = split_semantic_then_fallback(docs)
+        if not chunks:
+            raise HTTPException(status_code=400, detail="Chunking produced no chunks")
 
-            # FAISS
-            if app.state.faiss_vs is None:
-                app.state.faiss_vs = FAISS.from_documents(chunks, app.state.embeddings)
-            else:
-                app.state.faiss_vs.add_documents(chunks)
-            _save_faiss(app.state.faiss_vs)
-
-            return {
-                "message": f"Successfully ingested {len(chunks)} chunks from {file.filename}.",
-                "chunks_added": len(chunks),
-                "bm25_corpus_size": len(app.state.bm25_docs),
-            }
-
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/chat", response_model=ChatResponse, summary="Ask the RAG Bot")
-async def chat(req: ChatRequest):
-    start = time.time()
-    q = (req.question or "").strip()
-    if not q:
-        raise HTTPException(status_code=400, detail="question is required.")
-
-    async with app.state.lock:
-        try:
-            bm25 = app.state.bm25
-            faiss_vs = app.state.faiss_vs
-
-            # no index yet
-            if bm25 is None or faiss_vs is None:
-                end = time.time()
-                return ChatResponse(
-                    answer=_fallback_no_info(q),
-                    time_taken=end - start,
-                    sources=[],
-                )
-
-            faiss_ret = faiss_vs.as_retriever(search_kwargs={"k": TOP_K_FAISS})
-
-            bm25_docs = _safe_invoke(bm25, q)[:TOP_K_BM25]
-            faiss_docs = _safe_invoke(faiss_ret, q)[:TOP_K_FAISS]
-
-            docs = _rrf_fuse(bm25_docs, faiss_docs, W_BM25, W_FAISS, top_k=TOP_K_ENSEMBLE)
-
-            if not docs:
-                end = time.time()
-                return ChatResponse(
-                    answer=_fallback_no_info(q),
-                    time_taken=end - start,
-                    sources=[],
-                )
-
-            context = _format_context(docs)
-            sources = _sources_from_docs(docs)
-
-            answer = app.state.chain.invoke({"context": context, "question": q})
-            end = time.time()
-
-            return ChatResponse(
-                answer=answer,
-                time_taken=end - start,
-                sources=sources,
+        # 메타데이터 정리(중요: Chroma는 None/복잡 타입 싫어함)
+        for i, d in enumerate(chunks):
+            d.metadata = d.metadata or {}
+            d.metadata.update(
+                {
+                    "doc_id": doc_id,
+                    "source": file.filename,
+                    "chunk_index": i,
+                }
             )
 
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            # page는 없을 수 있으니 None이면 제거
+            page = d.metadata.get("page")
+            if page is None:
+                d.metadata.pop("page", None)
+            else:
+                # 혹시 문자열인 경우도 있어 int로 고정
+                try:
+                    d.metadata["page"] = int(page)
+                except Exception:
+                    d.metadata.pop("page", None)
+
+        # 1) LangChain helper로 복잡 메타 1차 정리
+        chunks = filter_complex_metadata(chunks)
+
+        # 2) 최종적으로 Chroma 허용 타입으로 강제
+        for d in chunks:
+            d.metadata = sanitize_metadata(d.metadata)
+
+        vectordb: Chroma = app.state.vectordb
+        vectordb.add_documents(chunks)
+
+    # BM25는 데이터 변경 때만 rebuild
+    async with app.state.rebuild_lock:
+        await rebuild_bm25(app)
+
+    return {"message": f"Ingested {len(chunks)} chunks", "doc_id": doc_id}
 
 
+# =========================
+# 10) Chat API (Hybrid RAG)
+# =========================
+@app.post("/chat", response_model=ChatResponse)
+async def chat(req: ChatRequest):
+    start = time.time()
+    vectordb: Chroma = app.state.vectordb
+    bm25: Optional[BM25Retriever] = app.state.bm25
+
+    # Dense: MMR (중복 덜 가져오고 다양성 확보)
+    dense_retriever = vectordb.as_retriever(
+        search_type="mmr",
+        search_kwargs={
+            "k": K_DENSE,
+            "fetch_k": FETCH_K,
+            "lambda_mult": LAMBDA_MULT,
+        },
+    )
+    dense_docs = dense_retriever.invoke(req.question)
+
+    # Sparse: BM25 (없으면 빈 리스트)
+    sparse_docs: List[Document] = []
+    if bm25 is not None:
+        bm25.k = K_SPARSE
+        sparse_docs = bm25.invoke(req.question)
+
+    # Hybrid merge (RRF)
+    final_docs = rrf_merge(dense_docs, sparse_docs, k_final=K_FINAL, rrf_k=RRF_K)
+
+    if not final_docs:
+        answer = (
+            "У меня нет информации об этом в моих документах."
+            if is_russian(req.question)
+            else "I don't have information about that in my documents."
+        )
+        return ChatResponse(answer=answer, time_taken=time.time() - start, sources=[])
+
+    context = build_context(final_docs, max_chars=MAX_CONTEXT_CHARS)
+    sources = [
+        SourceInfo(
+            file=(d.metadata or {}).get("source", "unknown"),
+            page=(d.metadata or {}).get("page"),
+            snippet=d.page_content[:300],
+        )
+        for d in final_docs
+    ]
+
+    chain = prompt | llm | StrOutputParser()
+    answer = chain.invoke({"context": context, "question": req.question})
+
+    return ChatResponse(answer=answer, time_taken=time.time() - start, sources=sources)
+
+
+# =========================
+# 11) List Documents API
+# =========================
+@app.get("/documents")
+async def list_documents():
+    vectordb: Chroma = app.state.vectordb
+    data = vectordb._collection.get(include=["metadatas"])
+
+    documents: Dict[str, str] = {}
+    for meta in data.get("metadatas", []):
+        if meta and "doc_id" in meta and "source" in meta:
+            documents[meta["doc_id"]] = meta["source"]
+
+    return {"documents": documents}
+
+
+# =========================
+# 12) Delete Document API
+# =========================
+@app.delete("/documents/{doc_id}")
+async def delete_document(doc_id: str):
+    async with app.state.write_lock:
+        vectordb: Chroma = app.state.vectordb
+        data = vectordb._collection.get(where={"doc_id": doc_id})
+        ids = data.get("ids", [])
+        if not ids:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        vectordb._collection.delete(ids=ids)
+
+    async with app.state.rebuild_lock:
+        await rebuild_bm25(app)
+
+    return {"deleted_chunks": len(ids), "doc_id": doc_id}
+
+
+# =========================
+# 13) Clear All Documents API
+# =========================
+@app.delete("/documents")
+async def clear_all_documents():
+    try:
+        async with app.state.write_lock:
+            if os.path.exists(DB_DIR):
+                shutil.rmtree(DB_DIR)
+            os.makedirs(DB_DIR, exist_ok=True)
+
+            if os.path.exists(UPLOAD_DIR):
+                shutil.rmtree(UPLOAD_DIR)
+            os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+            # VectorDB 핸들 재생성
+            app.state.vectordb = get_vectorstore()
+            app.state.bm25 = None
+
+        return {"message": "All documents cleared (DB + uploads)."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =========================
+# 14) Run
+# =========================
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
