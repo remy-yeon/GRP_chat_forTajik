@@ -18,6 +18,7 @@ import shutil
 import time
 import uuid
 import asyncio
+import math
 from typing import List, Optional, Dict, Tuple
 from contextlib import asynccontextmanager
 
@@ -50,15 +51,16 @@ DB_DIR = "chroma_db"
 # 2) Retrieval 튜닝 파라미터
 # =========================
 # Dense 검색(MMR)
-K_DENSE = 8               # 최종 dense 반환 개수
+K_DENSE = 20 #8               # 최종 dense 반환 개수
 FETCH_K = 40              # MMR이 후보로 더 많이 뽑아 다양성 고려
 LAMBDA_MULT = 0.35        # 1에 가까울수록 유사성, 0에 가까울수록 다양성
 
 # Sparse 검색(BM25)
-K_SPARSE = 8
+K_SPARSE = 20 #8
 
 # Hybrid merge
-K_FINAL = 4               # LLM에 넣을 최종 문서 개수
+# K_FINAL = 4               # LLM에 넣을 최종 문서 개수
+K_FINAL = 8
 RRF_K = 60                # RRF 안정 상수(크면 랭크 차이 완만)
 
 # Context 길이 제한(너무 길면 속도/품질 흔들림 방지)
@@ -212,6 +214,8 @@ def rrf_merge(
     sparse_docs: List[Document],
     k_final: int = K_FINAL,
     rrf_k: int = RRF_K,
+    dense_weight: float = 0.3,
+    sparse_weight: float = 0.7,
 ) -> List[Document]:
     """
     Reciprocal Rank Fusion: score = Σ 1/(rrf_k + rank)
@@ -236,8 +240,8 @@ def rrf_merge(
 # ✅ 팩트 검증/정보성 QA가 더 많다(고도, 위치, 이름, 입장, 운영 등)
 # dense 0.3~0.4 / sparse 0.6~0.7
     
-    add(dense_docs, weight=0.3)
-    add(sparse_docs, weight=0.7)
+    add(dense_docs, weight=dense_weight)
+    add(sparse_docs, weight=sparse_weight)
 
     merged = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     return [by_key[k] for k, _ in merged[:k_final]]
@@ -260,6 +264,48 @@ async def rebuild_bm25(app: FastAPI) -> None:
         app.state.bm25 = bm25
     else:
         app.state.bm25 = None
+
+def cosine(a: List[float], b: List[float]) -> float:
+    dot = sum(x*y for x, y in zip(a, b))
+    na = math.sqrt(sum(x*x for x in a))
+    nb = math.sqrt(sum(y*y for y in b))
+    return dot / (na*nb + 1e-12)
+
+def rerank_by_embedding(query: str, docs: List[Document], top_k: int) -> List[Document]:
+    q = embedding_model.embed_query(query)
+    doc_vecs = embedding_model.embed_documents([d.page_content for d in docs])
+    scored = [(cosine(q, v), d) for v, d in zip(doc_vecs, docs)]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [d for _, d in scored[:top_k]]
+
+def is_fact_question(q: str) -> bool:
+    """
+    팩트/정확 근거가 중요한 질문 감지:
+    - 숫자/단위/연도
+    - name/located/which/where/how many 등
+    """
+    ql = q.lower()
+
+    # 숫자 포함(1911, 5000m 등)
+    if any(ch.isdigit() for ch in q):
+        return True
+
+    patterns = [
+        r"\bhow many\b",
+        r"\bhow high\b",
+        r"\bwhat(?:'s| is) the name\b",
+        r"\bwhich\b",
+        r"\bwhere\b",
+        r"\blocated\b",
+        r"\byear\b",
+        r"\bcentury\b",
+        r"\bmeters?\b",
+        r"\bmetres?\b",
+        r"\bkm\b",
+        r"\baltitude\b",
+        r"\bheight\b",
+    ]
+    return any(re.search(p, ql) for p in patterns)
 
 
 # =========================
@@ -372,15 +418,42 @@ async def chat(req: ChatRequest):
     bm25: Optional[BM25Retriever] = app.state.bm25
 
     # Dense: MMR (중복 덜 가져오고 다양성 확보)
-    dense_retriever = vectordb.as_retriever(
-        search_type="mmr",
-        search_kwargs={
+    # dense_retriever = vectordb.as_retriever(
+    #     search_type="mmr",
+    #     search_kwargs={
+    #         "k": K_DENSE,
+    #         "fetch_k": FETCH_K,
+    #         "lambda_mult": LAMBDA_MULT,
+    #     },
+    # )
+    fact = is_fact_question(req.question)
+
+    # 질문 타입별 전략 설정
+    if fact:
+        # 팩트형: 정확한 근거 우선
+        dense_search_type = "similarity"
+        dense_kwargs = {"k": K_DENSE}
+        dense_weight, sparse_weight = 0.3, 0.7
+
+        # (선택) rerank는 유지 추천 (근거 누락 줄이는 데 도움)
+        rerank = True
+    else:
+        # 추천/설명형: 의미/다양성 우선
+        dense_search_type = "mmr"
+        dense_kwargs = {
             "k": K_DENSE,
             "fetch_k": FETCH_K,
-            "lambda_mult": LAMBDA_MULT,
-        },
+            "lambda_mult": 0.7,  # 추천/설명형은 유사성 더 주는 편이 안정적
+        }
+        dense_weight, sparse_weight = 0.6, 0.4
+        rerank = True  # 추천형도 rerank가 종종 도움됨(원치 않으면 False)
+
+    dense_retriever = vectordb.as_retriever(
+        search_type=dense_search_type,
+        search_kwargs=dense_kwargs,
     )
     dense_docs = dense_retriever.invoke(req.question)
+
 
     # Sparse: BM25 (없으면 빈 리스트)
     sparse_docs: List[Document] = []
@@ -389,7 +462,21 @@ async def chat(req: ChatRequest):
         sparse_docs = bm25.invoke(req.question)
 
     # Hybrid merge (RRF)
-    final_docs = rrf_merge(dense_docs, sparse_docs, k_final=K_FINAL, rrf_k=RRF_K)
+    # final_docs = rrf_merge(dense_docs, sparse_docs, k_final=K_FINAL, rrf_k=RRF_K)
+    final_candidates = rrf_merge(
+        dense_docs,
+        sparse_docs,
+        k_final=20,
+        rrf_k=RRF_K,
+        dense_weight=dense_weight,
+        sparse_weight=sparse_weight,
+    )
+    if rerank:
+        final_docs = rerank_by_embedding(req.question, final_candidates, top_k=K_FINAL)
+    else:
+        final_docs = final_candidates[:K_FINAL]
+
+
 
     if not final_docs:
         answer = (
