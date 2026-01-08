@@ -75,6 +75,11 @@ You are a helpful travel assistant for tourists interested in visiting Tajikista
 
 Use ONLY the information provided in [Context].
 
+Language rules (STRICT):
+- If the question is in Russian, answer in Russian.
+- Otherwise, answer in English.
+- Do not use any other language.
+
 Guidelines:
 1. Answer as if you are helping a traveler understand the destination,
    not as if you are analyzing or describing a document.
@@ -86,8 +91,7 @@ Guidelines:
 5. If the question asks about problems or challenges, explain them in a way
    that helps travelers understand what to expect.
 6. Do not infer or add information that is not clearly supported by the context.
-7. Answer in the same language as the question.
-8. Write in clear, natural sentences suitable for a travel guide or tourism app.
+7. Write in clear, natural sentences suitable for a travel guide or tourism app.
 
 [Context]:
 {context}
@@ -97,6 +101,7 @@ Guidelines:
 
 [Answer]:
 """.strip()
+
 
 prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
 
