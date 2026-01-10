@@ -23,6 +23,8 @@ from typing import List, Optional, Dict, Tuple
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from langchain_core.documents import Document
@@ -45,18 +47,19 @@ from langchain_community.vectorstores.utils import filter_complex_metadata
 # =========================
 UPLOAD_DIR = "data_storage"
 DB_DIR = "chroma_db"
+STATIC_DIR = "static"
 
 
 # =========================
 # 2) Retrieval 튜닝 파라미터
 # =========================
 # Dense 검색(MMR)
-K_DENSE = 20 #8               # 최종 dense 반환 개수
-FETCH_K = 40              # MMR이 후보로 더 많이 뽑아 다양성 고려
-LAMBDA_MULT = 0.35        # 1에 가까울수록 유사성, 0에 가까울수록 다양성
+K_DENSE = 20  #8               # 최종 dense 반환 개수
+FETCH_K = 40                   # MMR이 후보로 더 많이 뽑아 다양성 고려
+LAMBDA_MULT = 0.35             # 1에 가까울수록 유사성, 0에 가까울수록 다양성
 
 # Sparse 검색(BM25)
-K_SPARSE = 20 #8
+K_SPARSE = 20  #8
 
 # Hybrid merge
 # K_FINAL = 4               # LLM에 넣을 최종 문서 개수
@@ -66,6 +69,10 @@ RRF_K = 60                # RRF 안정 상수(크면 랭크 차이 완만)
 # Context 길이 제한(너무 길면 속도/품질 흔들림 방지)
 MAX_CONTEXT_CHARS = 6500
 
+# History 길이 제한(프롬프트 과부하 방지)
+MAX_HISTORY_CHARS = 2500
+MAX_HISTORY_TURNS = 12
+
 
 # =========================
 # 3) Prompt
@@ -73,7 +80,16 @@ MAX_CONTEXT_CHARS = 6500
 PROMPT_TEMPLATE = """
 You are a helpful travel assistant for tourists interested in visiting Tajikistan.
 
-Use ONLY the information provided in [Context].
+Use ONLY the information provided in [Context] for factual claims.
+
+You may use [History] only to understand conversational references
+(e.g., "that place", "the previous one", "what you said earlier"),
+but do NOT introduce new facts from [History] that are not supported by [Context].
+
+Language rules (STRICT):
+- If the question is in Russian, answer in Russian.
+- Otherwise, answer in English.
+- Do not use any other language.
 
 Guidelines:
 1. Answer as if you are helping a traveler understand the destination,
@@ -86,8 +102,10 @@ Guidelines:
 5. If the question asks about problems or challenges, explain them in a way
    that helps travelers understand what to expect.
 6. Do not infer or add information that is not clearly supported by the context.
-7. Answer in the same language as the question.
-8. Write in clear, natural sentences suitable for a travel guide or tourism app.
+7. Write in clear, natural sentences suitable for a travel guide or tourism app.
+
+[History]:
+{history}
 
 [Context]:
 {context}
@@ -98,24 +116,38 @@ Guidelines:
 [Answer]:
 """.strip()
 
-PROMPT_TEMPLATE_RU = """
-Вы полезный туристический помощник для путешественников,
-интересующихся Таджикистаном.
+prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
 
-Используйте ТОЛЬКО информацию из [Context].
 
-Правила:
-1. Отвечайте так, как будто вы помогаете путешественнику,
-   а не анализируете документ.
-2. Не упоминайте документы, отчёты, страницы или источники.
-3. Избегайте общих, учебниковых объяснений.
-4. Сосредотачивайтесь на практической информации:
-   регионы, маршруты, условия, примеры из контекста.
-5. Если вопрос о трудностях или проблемах — объясняйте,
-   чего ожидать туристу.
-6. Не добавляйте информацию, которой нет в контексте.
-7. Отвечайте ТОЛЬКО на русском языке.
-8. Пишите естественным, разговорным русским языком.
+# =========================
+# 3.1) Embassy Prompt (긴급/대사관 전용)
+# =========================
+EMBASSY_PROMPT_TEMPLATE = """
+You are helping a traveler in an urgent situation in Tajikistan (e.g., lost or stolen passport).
+
+Use ONLY the information provided in [Context] for factual claims.
+You may use [History] only to resolve references, but never add new facts not supported by [Context].
+
+Language rules (STRICT):
+- If the question is in Russian, answer in Russian.
+- Otherwise, answer in English.
+- Do not use any other language.
+
+Response requirements:
+1. Provide the embassy/consulate contact information clearly and directly.
+2. If the information exists in the context, you MUST include ALL of the following fields:
+   - Embassy/Consulate name
+   - City
+   - Address/location
+   - Phone number(s) (including emergency number if present)
+3. If a phone number is present in the context, you MUST explicitly include it in the answer.
+   Do NOT omit phone numbers under any circumstances.
+4. If the context does not contain the specific country’s embassy info, explicitly say you do not have it in your documents.
+5. Do NOT mention documents, pages, sources, or citations.
+
+
+[History]:
+{history}
 
 [Context]:
 {context}
@@ -126,6 +158,47 @@ PROMPT_TEMPLATE_RU = """
 [Answer]:
 """.strip()
 
+embassy_prompt = ChatPromptTemplate.from_template(EMBASSY_PROMPT_TEMPLATE)
+
+
+# =========================
+# 3.2) Hospital Prompt (추가)
+# =========================
+HOSPITAL_PROMPT_TEMPLATE = """
+You are helping a traveler who needs hospital information in Tajikistan.
+
+Use ONLY the information provided in [Context] for factual claims.
+You may use [History] only to resolve references, but never add new facts not supported by [Context].
+
+Language rules (STRICT):
+- If the question is in Russian, answer in Russian.
+- Otherwise, answer in English.
+- Do not use any other language.
+
+Response requirements:
+1. Provide 1–2 hospitals in the requested city.
+2. If available in the context, include:
+   - Hospital name
+   - City
+   - Address/location
+   - Phone number(s)
+3. If the context does not contain hospitals for that city, say you do not have it in your documents.
+4. Do NOT mention documents, pages, sources, or citations.
+5. Do NOT give medical advice or diagnosis; only provide contact info.
+
+[History]:
+{history}
+
+[Context]:
+{context}
+
+[Question]:
+{question}
+
+[Answer]:
+""".strip()
+
+hospital_prompt = ChatPromptTemplate.from_template(HOSPITAL_PROMPT_TEMPLATE)
 
 
 # =========================
@@ -156,8 +229,14 @@ class SourceInfo(BaseModel):
     snippet: str
 
 
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
 class ChatRequest(BaseModel):
     question: str
+    history: Optional[List[ChatMessage]] = None
 
 
 class ChatResponse(BaseModel):
@@ -226,6 +305,34 @@ def build_context(docs: List[Document], max_chars: int = MAX_CONTEXT_CHARS) -> s
     return "\n\n---\n\n".join(parts)
 
 
+def build_history(history: Optional[List[ChatMessage]]) -> str:
+    """
+    프론트에서 넘어온 history를 프롬프트에 넣기 좋게 문자열로 변환.
+    - 너무 길면 최근 메시지 위주로 자름
+    """
+    if not history:
+        return ""
+
+    recent = history[-MAX_HISTORY_TURNS:]
+    lines: List[str] = []
+    for m in recent:
+        role = (m.role or "").strip().lower()
+        content = (m.content or "").strip()
+        if not content:
+            continue
+        if role == "user":
+            lines.append(f"User: {content}")
+        elif role == "assistant":
+            lines.append(f"Assistant: {content}")
+        else:
+            lines.append(f"{role.capitalize() if role else 'Message'}: {content}")
+
+    text = "\n".join(lines).strip()
+    if len(text) <= MAX_HISTORY_CHARS:
+        return text
+    return text[-MAX_HISTORY_CHARS:]
+
+
 def doc_key(d: Document) -> str:
     """
     중복 제거 키: (doc_id, chunk_index, source) 우선, 없으면 내용 기반
@@ -257,16 +364,6 @@ def rrf_merge(
             by_key[key] = d
             scores[key] = scores.get(key, 0.0) + weight * (1.0 / (rrf_k + rank))
 
-    # 가중치(원하면 조절): dense를 조금 더 믿는 편
-    
-#     추천 기본값(관광 챗봇 운영 관점)
-# ✅ 기본(가장 무난)
-# dense 0.45 / sparse 0.55
-# ✅ 대화형·추천형이 더 많다(“어디 가야 해?”, “분위기 좋은 곳?”, “아이랑 가기 좋나?”)
-# dense 0.6 / sparse 0.4
-# ✅ 팩트 검증/정보성 QA가 더 많다(고도, 위치, 이름, 입장, 운영 등)
-# dense 0.3~0.4 / sparse 0.6~0.7
-    
     add(dense_docs, weight=dense_weight)
     add(sparse_docs, weight=sparse_weight)
 
@@ -292,11 +389,13 @@ async def rebuild_bm25(app: FastAPI) -> None:
     else:
         app.state.bm25 = None
 
+
 def cosine(a: List[float], b: List[float]) -> float:
     dot = sum(x*y for x, y in zip(a, b))
     na = math.sqrt(sum(x*x for x in a))
     nb = math.sqrt(sum(y*y for y in b))
     return dot / (na*nb + 1e-12)
+
 
 def rerank_by_embedding(query: str, docs: List[Document], top_k: int) -> List[Document]:
     q = embedding_model.embed_query(query)
@@ -304,6 +403,7 @@ def rerank_by_embedding(query: str, docs: List[Document], top_k: int) -> List[Do
     scored = [(cosine(q, v), d) for v, d in zip(doc_vecs, docs)]
     scored.sort(key=lambda x: x[0], reverse=True)
     return [d for _, d in scored[:top_k]]
+
 
 def is_fact_question(q: str) -> bool:
     """
@@ -336,12 +436,275 @@ def is_fact_question(q: str) -> bool:
 
 
 # =========================
+# 7.1) Embassy / Emergency intent & nationality extraction (추가)
+# =========================
+def needs_embassy_help(q: str) -> bool:
+    """
+    여권 분실/도난/긴급 상황에서 대사관 안내가 필요한지 감지 (rule-based 1차)
+    """
+    ql = (q or "").lower()
+    keywords = [
+        "lost passport",
+        "lost my passport",
+        "passport lost",
+        "stolen passport",
+        "passport stolen",
+        "my passport was stolen",
+        "i lost my passport",
+        "i have lost my passport",
+        "i lost passport",
+        "embassy",
+        "consulate",
+        "emergency",
+        "urgent",
+        "robbed",
+        "theft",
+        "stolen",
+        "visa problem",
+        "need help",
+        "lost documents",
+        "lost my id",
+    ]
+    if any(k in ql for k in keywords):
+        return True
+
+    # 러시아어 키워드(간단 버전)
+    ru_keywords = [
+        "потерял паспорт",
+        "потеряла паспорт",
+        "украли паспорт",
+        "посольство",
+        "консульство",
+        "срочно",
+        "экстренно",
+    ]
+    if any(k in ql for k in ru_keywords):
+        return True
+
+    return False
+
+
+def extract_nationality(text: str) -> Optional[str]:
+    """
+    사용자가 말한 국적(또는 국가)을 명시적 표현에서만 추출.
+    예:
+    - "I am American"
+    - "I'm Korean"
+    - "My nationality is German"
+    - "Citizen of France"
+
+    ⚠️ 단순 문장("i lost my passport")을
+    국적으로 오인하지 않도록 단답 fallback 제거
+    """
+    if not text:
+        return None
+
+    t = text.strip()
+
+    patterns = [
+        r"\bI am\s+([A-Za-z][A-Za-z \-]{1,40})\b",
+        r"\bI'm\s+([A-Za-z][A-Za-z \-]{1,40})\b",
+        r"\bI’m\s+([A-Za-z][A-Za-z \-]{1,40})\b",
+        r"\bmy nationality is\s+([A-Za-z][A-Za-z \-]{1,40})\b",
+        r"\bmy country is\s+([A-Za-z][A-Za-z \-]{1,40})\b",
+        r"\bnationality:\s*([A-Za-z][A-Za-z \-]{1,40})\b",
+        r"\bcitizen of\s+([A-Za-z][A-Za-z \-]{1,40})\b",
+    ]
+
+    for p in patterns:
+        m = re.search(p, t, flags=re.IGNORECASE)
+        if m:
+            cand = m.group(1).strip(" .,!?:;\"'")
+            if cand:
+                return cand
+
+    return None
+
+
+
+def was_nationality_requested(history: Optional[List[ChatMessage]]) -> bool:
+    """
+    history만 보고 '직전에 국적을 물어본 상태인지' 판단
+    - 세션 저장 안 하고, stateless로 구현하기 위해 사용
+    """
+    if not history:
+        return False
+    # 최근 assistant 메시지 중 nationality 요청이 있었는지 확인
+    recent = history[-MAX_HISTORY_TURNS:]
+    for m in reversed(recent):
+        if (m.role or "").strip().lower() != "assistant":
+            continue
+        c = (m.content or "").lower()
+        if "nationality" in c or "what is your nationality" in c or "tell me your nationality" in c:
+            return True
+        # 러시아어
+        if "гражданство" in c or "какое у вас гражданство" in c:
+            return True
+        # 국적 문의를 만나면 거기서 멈춤(그 이후 더 과거는 안 봐도 됨)
+        break
+    return False
+
+
+def find_nationality_from_history(history: Optional[List[ChatMessage]]) -> Optional[str]:
+    """
+    history에서 user가 말한 국적을 찾아봄 (최근 user 발화 우선)
+    """
+    if not history:
+        return None
+    recent = history[-MAX_HISTORY_TURNS:]
+    for m in reversed(recent):
+        if (m.role or "").strip().lower() != "user":
+            continue
+        nat = extract_nationality(m.content or "")
+        if nat:
+            return nat
+    return None
+
+
+# =========================
+# 7.2) Hospital intent & city extraction (추가)
+# =========================
+def needs_hospital_help(q: str) -> bool:
+    """
+    병원/진료/아픔/의료 도움 질문 감지 (rule-based 1차)
+    """
+    ql = (q or "").lower()
+    keywords = [
+        "hospital",
+        "clinic",
+        "doctor",
+        "medical",
+        "i am sick",
+        "i'm sick",
+        "i feel sick",
+        "i am ill",
+        "i'm ill",
+        "fever",
+        "pain",
+        "injury",
+        "injured",
+        "need a doctor",
+        "need hospital",
+        "where is a hospital",
+        "where can i see a doctor",
+        "emergency room",
+        "er",
+    ]
+    if any(k in ql for k in keywords):
+        return True
+
+    ru_keywords = [
+        "больница",
+        "клиника",
+        "врач",
+        "мне плохо",
+        "я болен",
+        "температура",
+        "боль",
+        "травма",
+        "скорая",
+    ]
+    if any(k in ql for k in ru_keywords):
+        return True
+
+    return False
+
+
+def extract_city(text: str) -> Optional[str]:
+    """
+    도시를 명시적으로 말한 경우만 추출.
+    예:
+    - "I am in Dushanbe"
+    - "I'm in Khujand"
+    - "in Dushanbe"
+    - "at Dushanbe"
+    """
+    if not text:
+        return None
+    t = text.strip()
+
+    patterns = [
+        r"\bI am in\s+([A-Za-z][A-Za-z \-]{1,40})\b",
+        r"\bI'm in\s+([A-Za-z][A-Za-z \-]{1,40})\b",
+        r"\bI’m in\s+([A-Za-z][A-Za-z \-]{1,40})\b",
+        r"\bin\s+([A-Za-z][A-Za-z \-]{1,40})\b",
+        r"\bat\s+([A-Za-z][A-Za-z \-]{1,40})\b",
+        r"\bcity:\s*([A-Za-z][A-Za-z \-]{1,40})\b",
+    ]
+    for p in patterns:
+        m = re.search(p, t, flags=re.IGNORECASE)
+        if m:
+            cand = m.group(1).strip(" .,!?:;\"'")
+            if cand:
+                return cand
+    return None
+
+
+def was_city_requested(history: Optional[List[ChatMessage]]) -> bool:
+    """
+    직전에 '도시를 물어본 상태인지' 판단 (stateless)
+    """
+    if not history:
+        return False
+    recent = history[-MAX_HISTORY_TURNS:]
+    for m in reversed(recent):
+        if (m.role or "").strip().lower() != "assistant":
+            continue
+        c = (m.content or "").lower()
+        if "which city" in c or "what city" in c or "city are you in" in c or "currently in" in c:
+            return True
+        if "в каком городе" in c:
+            return True
+        break
+    return False
+
+
+def find_city_from_history(history: Optional[List[ChatMessage]]) -> Optional[str]:
+    """
+    history에서 user가 말한 도시를 찾아봄 (최근 user 발화 우선)
+    """
+    if not history:
+        return None
+    recent = history[-MAX_HISTORY_TURNS:]
+    for m in reversed(recent):
+        if (m.role or "").strip().lower() != "user":
+            continue
+        city = extract_city(m.content or "")
+        if city:
+            return city
+    return None
+
+
+def extract_city_fallback_if_awaiting(history: Optional[List[ChatMessage]], text: str) -> Optional[str]:
+    """
+    직전에 도시를 물어본 상태라면,
+    user가 'Dushanbe' 처럼 단답으로만 도시를 말했을 때도 도시로 인정.
+    """
+    if not text:
+        return None
+    if not was_city_requested(history):
+        return None
+
+    t = text.strip()
+    # 너무 긴 문장/숫자/특수문자 많은 경우 제외
+    if len(t) > 40:
+        return None
+    if any(ch.isdigit() for ch in t):
+        return None
+    # 영문/공백/하이픈만 허용
+    if not re.fullmatch(r"[A-Za-z \-]+", t):
+        return None
+    return t.strip(" -")
+
+
+# =========================
 # 8) FastAPI Lifespan (캐시/락 준비)
 # =========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     os.makedirs(DB_DIR, exist_ok=True)
+    os.makedirs(STATIC_DIR, exist_ok=True)
 
     app.state.vectordb = get_vectorstore()
     app.state.bm25 = None
@@ -363,6 +726,17 @@ app = FastAPI(
     title="Tajikistan RAG API (Ollama Embeddings + Gemma2)",
     lifespan=lifespan,
 )
+
+
+# =========================
+# Frontend (Static)
+# =========================
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.get("/")
+async def serve_index():
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
 
 
 # =========================
@@ -436,7 +810,7 @@ async def ingest_document(file: UploadFile = File(...)):
 
 
 # =========================
-# 10) Chat API (Hybrid RAG)
+# 10) Chat API (Hybrid RAG + Embassy flow)
 # =========================
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
@@ -444,36 +818,217 @@ async def chat(req: ChatRequest):
     vectordb: Chroma = app.state.vectordb
     bm25: Optional[BM25Retriever] = app.state.bm25
 
-    # Dense: MMR (중복 덜 가져오고 다양성 확보)
-    # dense_retriever = vectordb.as_retriever(
-    #     search_type="mmr",
-    #     search_kwargs={
-    #         "k": K_DENSE,
-    #         "fetch_k": FETCH_K,
-    #         "lambda_mult": LAMBDA_MULT,
-    #     },
-    # )
-    fact = is_fact_question(req.question)
+    history_text = build_history(req.history)
 
-    # 질문 타입별 전략 설정
-    if fact:
-        # 팩트형: 정확한 근거 우선
+    # -------------------------
+    # Hospital flow (추가)
+    # - "아파요/병원" 류 질문이면 도시 먼저 확인 후 병원 1~2개 제공
+    # - Embassy와 충돌 방지: 여권/대사관 키워드가 명확하면 embassy 우선
+    # -------------------------
+    hospital_intent = needs_hospital_help(req.question)
+    if hospital_intent:
+        ql = (req.question or "").lower()
+        passport_like = any(k in ql for k in ["passport", "embassy", "consulate", "visa"])
+
+        if not passport_like:
+            city_in_question = extract_city(req.question)
+            city_in_history = find_city_from_history(req.history)
+            city_fallback = extract_city_fallback_if_awaiting(req.history, req.question)
+
+            city = city_in_question or city_in_history or city_fallback
+
+            if city is None:
+                if is_russian(req.question):
+                    answer = (
+                        "Понимаю. Чтобы подсказать больницу, скажите, пожалуйста, в каком городе вы находитесь "
+                        "(например: Dushanbe, Khujand, Bokhtar)."
+                    )
+                else:
+                    answer = (
+                        "I understand. To suggest a hospital, which city are you currently in "
+                        "(e.g., Dushanbe, Khujand, Bokhtar)?"
+                    )
+                return ChatResponse(answer=answer, time_taken=time.time() - start, sources=[])
+
+            # 병원은 팩트형(연락처/주소)
+            dense_search_type = "similarity"
+            dense_kwargs = {"k": K_DENSE}
+            dense_weight, sparse_weight = 0.3, 0.7
+            rerank = True
+
+            # hospital.txt 레코드가 "City: xxx", "Type: Hospital" 형태라서 이 쿼리가 잘 맞음
+            if is_russian(req.question):
+                search_query = f"Type: Hospital City: {city} телефон адрес"
+            else:
+                search_query = f"Type: Hospital City: {city} phone address"
+
+            dense_retriever = vectordb.as_retriever(
+                search_type=dense_search_type,
+                search_kwargs=dense_kwargs,
+            )
+            dense_docs = dense_retriever.invoke(search_query)
+
+            sparse_docs: List[Document] = []
+            if bm25 is not None:
+                bm25.k = K_SPARSE
+                sparse_docs = bm25.invoke(search_query)
+
+            final_candidates = rrf_merge(
+                dense_docs,
+                sparse_docs,
+                k_final=20,
+                rrf_k=RRF_K,
+                dense_weight=dense_weight,
+                sparse_weight=sparse_weight,
+            )
+            if rerank:
+                final_docs = rerank_by_embedding(search_query, final_candidates, top_k=K_FINAL)
+            else:
+                final_docs = final_candidates[:K_FINAL]
+
+            # 도시 병원만 강하게 걸러내기(가끔 다른 도시가 섞여 들어올 때 방지)
+            # (컨텍스트가 "City: X"로 명시되는 txt 구조에 최적)
+            city_filtered = []
+            for d in final_docs:
+                txt = (d.page_content or "").lower()
+                if f"city: {city.lower()}" in txt:
+                    city_filtered.append(d)
+            if city_filtered:
+                final_docs = city_filtered
+
+            # 1~2개만
+            final_docs = final_docs[:2]
+
+            if not final_docs:
+                answer = (
+                    f"У меня нет информации о больницах в городе {city} в моих документах."
+                    if is_russian(req.question)
+                    else f"I don’t have hospital information for {city} in my documents."
+                )
+                return ChatResponse(answer=answer, time_taken=time.time() - start, sources=[])
+
+            context = build_context(final_docs, max_chars=MAX_CONTEXT_CHARS)
+
+            sources = [
+                SourceInfo(
+                    file=(d.metadata or {}).get("source", "unknown"),
+                    page=(d.metadata or {}).get("page"),
+                    snippet=d.page_content,
+                )
+                for d in final_docs
+            ]
+
+            chain = hospital_prompt | llm | StrOutputParser()
+            answer = chain.invoke({"context": context, "question": req.question, "history": history_text})
+
+            return ChatResponse(answer=answer, time_taken=time.time() - start, sources=sources)
+
+    # -------------------------
+    # Embassy flow (추가)
+    # -------------------------
+    embassy_intent = needs_embassy_help(req.question)
+
+    if embassy_intent:
+        nat_in_question = extract_nationality(req.question)
+        nat_in_history = find_nationality_from_history(req.history)
+
+        nationality = nat_in_question or nat_in_history
+
+        awaiting_nat = was_nationality_requested(req.history)
+
+        if nationality is None:
+            if is_russian(req.question):
+                answer = (
+                    "Понимаю — это срочная ситуация.\n"
+                    "Чтобы подсказать правильное посольство/консульство в Таджикистане, "
+                    "скажите, пожалуйста, ваше гражданство (например: USA, Korea, Germany)."
+                )
+            else:
+                answer = (
+                    "I’m sorry you’re dealing with this.\n"
+                    "To point you to the correct embassy/consulate in Tajikistan, "
+                    "what is your nationality (e.g., USA, Korea, Germany)?"
+                )
+            return ChatResponse(answer=answer, time_taken=time.time() - start, sources=[])
+
+        fact = True
         dense_search_type = "similarity"
         dense_kwargs = {"k": K_DENSE}
         dense_weight, sparse_weight = 0.3, 0.7
+        rerank = False
 
-        # (선택) rerank는 유지 추천 (근거 누락 줄이는 데 도움)
+        if is_russian(req.question):
+            search_query = f"посольство {nationality} Таджикистан Душанбе телефон адрес"
+        else:
+            search_query = f"embassy consulate {nationality} Tajikistan Dushanbe phone address"
+
+        dense_retriever = vectordb.as_retriever(
+            search_type=dense_search_type,
+            search_kwargs=dense_kwargs,
+        )
+        dense_docs = dense_retriever.invoke(search_query)
+
+        sparse_docs: List[Document] = []
+        if bm25 is not None:
+            bm25.k = K_SPARSE
+            sparse_docs = bm25.invoke(search_query)
+
+        final_candidates = rrf_merge(
+            dense_docs,
+            sparse_docs,
+            k_final=20,
+            rrf_k=RRF_K,
+            dense_weight=dense_weight,
+            sparse_weight=sparse_weight,
+        )
+        if rerank:
+            final_docs = rerank_by_embedding(search_query, final_candidates, top_k=K_FINAL)
+        else:
+            final_docs = final_candidates[:K_FINAL]
+
+        if not final_docs:
+            answer = (
+                "У меня нет информации о посольстве этой страны в моих документах."
+                if is_russian(req.question)
+                else "I don’t have embassy/consulate information for that country in my documents."
+            )
+            return ChatResponse(answer=answer, time_taken=time.time() - start, sources=[])
+
+        context = build_context(final_docs, max_chars=MAX_CONTEXT_CHARS)
+
+        sources = [
+            SourceInfo(
+                file=(d.metadata or {}).get("source", "unknown"),
+                page=(d.metadata or {}).get("page"),
+                snippet=d.page_content,
+            )
+            for d in final_docs
+        ]
+
+        chain = embassy_prompt | llm | StrOutputParser()
+        answer = chain.invoke({"context": context, "question": req.question, "history": history_text})
+
+        return ChatResponse(answer=answer, time_taken=time.time() - start, sources=sources)
+
+    # -------------------------
+    # 기존 Travel RAG (그대로)
+    # -------------------------
+    fact = is_fact_question(req.question)
+
+    if fact:
+        dense_search_type = "similarity"
+        dense_kwargs = {"k": K_DENSE}
+        dense_weight, sparse_weight = 0.3, 0.7
         rerank = True
     else:
-        # 추천/설명형: 의미/다양성 우선
         dense_search_type = "mmr"
         dense_kwargs = {
             "k": K_DENSE,
             "fetch_k": FETCH_K,
-            "lambda_mult": 0.7,  # 추천/설명형은 유사성 더 주는 편이 안정적
+            "lambda_mult": 0.7,
         }
         dense_weight, sparse_weight = 0.6, 0.4
-        rerank = True  # 추천형도 rerank가 종종 도움됨(원치 않으면 False)
+        rerank = True
 
     dense_retriever = vectordb.as_retriever(
         search_type=dense_search_type,
@@ -481,15 +1036,11 @@ async def chat(req: ChatRequest):
     )
     dense_docs = dense_retriever.invoke(req.question)
 
-
-    # Sparse: BM25 (없으면 빈 리스트)
     sparse_docs: List[Document] = []
     if bm25 is not None:
         bm25.k = K_SPARSE
         sparse_docs = bm25.invoke(req.question)
 
-    # Hybrid merge (RRF)
-    # final_docs = rrf_merge(dense_docs, sparse_docs, k_final=K_FINAL, rrf_k=RRF_K)
     final_candidates = rrf_merge(
         dense_docs,
         sparse_docs,
@@ -503,8 +1054,6 @@ async def chat(req: ChatRequest):
     else:
         final_docs = final_candidates[:K_FINAL]
 
-
-
     if not final_docs:
         answer = (
             "У меня нет информации об этом в моих документах."
@@ -514,22 +1063,18 @@ async def chat(req: ChatRequest):
         return ChatResponse(answer=answer, time_taken=time.time() - start, sources=[])
 
     context = build_context(final_docs, max_chars=MAX_CONTEXT_CHARS)
+
     sources = [
         SourceInfo(
             file=(d.metadata or {}).get("source", "unknown"),
             page=(d.metadata or {}).get("page"),
-            snippet=d.page_content[:300],
+            snippet=d.page_content,
         )
         for d in final_docs
     ]
-    # 🔑 질문 언어에 따라 프롬프트 선택
-    if is_russian(req.question):
-        selected_prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE_RU)
-    else:
-        selected_prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
 
-    chain = selected_prompt | llm | StrOutputParser()
-    answer = chain.invoke({"context": context, "question": req.question})
+    chain = prompt | llm | StrOutputParser()
+    answer = chain.invoke({"context": context, "question": req.question, "history": history_text})
 
     return ChatResponse(answer=answer, time_taken=time.time() - start, sources=sources)
 
