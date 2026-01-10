@@ -185,6 +185,8 @@ Response requirements:
 3. If the context does not contain hospitals for that city, say you do not have it in your documents.
 4. Do NOT mention documents, pages, sources, or citations.
 5. Do NOT give medical advice or diagnosis; only provide contact info.
+6. If a phone number is present in the context, you MUST explicitly include it.
+   Do NOT omit phone numbers under any circumstances.
 
 [History]:
 {history}
@@ -825,7 +827,10 @@ async def chat(req: ChatRequest):
     # - "아파요/병원" 류 질문이면 도시 먼저 확인 후 병원 1~2개 제공
     # - Embassy와 충돌 방지: 여권/대사관 키워드가 명확하면 embassy 우선
     # -------------------------
-    hospital_intent = needs_hospital_help(req.question)
+    hospital_intent = (
+        needs_hospital_help(req.question)
+        or was_city_requested(req.history)
+    )
     if hospital_intent:
         ql = (req.question or "").lower()
         passport_like = any(k in ql for k in ["passport", "embassy", "consulate", "visa"])
@@ -854,7 +859,7 @@ async def chat(req: ChatRequest):
             dense_search_type = "similarity"
             dense_kwargs = {"k": K_DENSE}
             dense_weight, sparse_weight = 0.3, 0.7
-            rerank = True
+            rerank = False
 
             # hospital.txt 레코드가 "City: xxx", "Type: Hospital" 형태라서 이 쿼리가 잘 맞음
             if is_russian(req.question):
@@ -881,21 +886,34 @@ async def chat(req: ChatRequest):
                 dense_weight=dense_weight,
                 sparse_weight=sparse_weight,
             )
+
+            # 🔧 수정: Hospital flow에서는 병원 문서만 남기기
+            hospital_only = []
+            for d in final_candidates:
+                txt = (d.page_content or "").lower()
+                if "type: hospital" in txt:
+                    hospital_only.append(d)
+
+            if hospital_only:
+                final_candidates = hospital_only
+
+            # 도시 병원만 강하게 걸러내기(가끔 다른 도시가 섞여 들어올 때 방지)
+            # (컨텍스트가 "City: X"로 명시되는 txt 구조에 최적)
+            # city filter는 final_candidates 기준으로 해야 함
+            city_filtered = []
+            for d in final_candidates:
+                txt = (d.page_content or "").lower()
+                if "type: hospital" in txt and f"city: {city.lower()}" in txt:
+                    city_filtered.append(d)
+            if city_filtered:
+                final_candidates = city_filtered
+
             if rerank:
                 final_docs = rerank_by_embedding(search_query, final_candidates, top_k=K_FINAL)
             else:
                 final_docs = final_candidates[:K_FINAL]
 
-            # 도시 병원만 강하게 걸러내기(가끔 다른 도시가 섞여 들어올 때 방지)
-            # (컨텍스트가 "City: X"로 명시되는 txt 구조에 최적)
-            city_filtered = []
-            for d in final_docs:
-                txt = (d.page_content or "").lower()
-                if f"city: {city.lower()}" in txt:
-                    city_filtered.append(d)
-            if city_filtered:
-                final_docs = city_filtered
-
+    
             # 1~2개만
             final_docs = final_docs[:2]
 
