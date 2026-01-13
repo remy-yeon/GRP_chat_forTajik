@@ -1,12 +1,14 @@
 """
 main.py - Single-file RAG API (Ollama Embeddings + Chroma + Hybrid Retriever)
+Retrieval-first + Prompt-selection (NO intent state machine)
 
 Stack:
 - Chunking: SemanticChunker (fallback: RecursiveCharacterTextSplitter)
 - Vector DB: Chroma (persist_directory)
 - Embedding: OllamaEmbeddings("snowflake-arctic-embed2")
 - LLM: ChatOllama("gemma2:2b")
-- Hybrid Retrieval: Dense(MMR) + Sparse(BM25) merged by RRF
+- Hybrid Retrieval: Dense(similarity/MMR) + Sparse(BM25) merged by RRF
+- Rerank: cosine(embedding)
 - Performance: VectorDB + BM25 cached in app.state, BM25 rebuilt only on ingest/delete/clear
 """
 
@@ -19,12 +21,10 @@ import time
 import uuid
 import asyncio
 import math
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from langchain_core.documents import Document
@@ -41,6 +41,9 @@ from langchain_community.retrievers import BM25Retriever
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_community.vectorstores.utils import filter_complex_metadata
 
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
 
 # =========================
 # 1) Path 설정
@@ -53,37 +56,30 @@ STATIC_DIR = "static"
 # =========================
 # 2) Retrieval 튜닝 파라미터
 # =========================
-# Dense 검색(MMR)
+# Dense
 K_DENSE = 20
 FETCH_K = 40
 LAMBDA_MULT = 0.35
 
-# Sparse 검색(BM25)
+# Sparse (BM25)
 K_SPARSE = 20
 
-# Hybrid merge
+# Hybrid merge / final
 K_FINAL = 8
 RRF_K = 60
 
-# Context 길이 제한(너무 길면 속도/품질 흔들림 방지)
+# Context 제한
 MAX_CONTEXT_CHARS = 6500
 
-# History 길이 제한(프롬프트 과부하 방지)
-MAX_HISTORY_CHARS = 2500
-MAX_HISTORY_TURNS = 12
-
 
 # =========================
-# 3) Prompt
+# 3) Prompts
 # =========================
-PROMPT_TEMPLATE = """
+TRAVEL_PROMPT_TEMPLATE = """
 You are a helpful travel assistant for tourists interested in visiting Tajikistan.
 
 Use ONLY the information provided in [Context] for factual claims.
-
-You may use [History] only to understand conversational references
-(e.g., "that place", "the previous one", "what you said earlier"),
-but do NOT introduce new facts from [History] that are not supported by [Context].
+If the answer is not in the context, say you don't have that information.
 
 Language rules (STRICT):
 - If the question is in Russian, answer in Russian.
@@ -95,16 +91,9 @@ Guidelines:
    not as if you are analyzing or describing a document.
 2. Do not mention documents, reports, figures, pages, or sources explicitly.
 3. Avoid generic or textbook-style explanations.
-4. Focus on practical, concrete information that would be useful to travelers,
-   such as real examples, regions, activities, projects, or situations
-   mentioned in the context.
-5. If the question asks about problems or challenges, explain them in a way
-   that helps travelers understand what to expect.
-6. Do not infer or add information that is not clearly supported by the context.
-7. Write in clear, natural sentences suitable for a travel guide or tourism app.
-
-[History]:
-{history}
+4. Focus on practical, concrete information useful to travelers.
+5. Do not infer or add information not clearly supported by the context.
+6. Write in clear, natural sentences suitable for a travel guide / tourism app.
 
 [Context]:
 {context}
@@ -115,73 +104,50 @@ Guidelines:
 [Answer]:
 """.strip()
 
-prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
 
-
-# =========================
-# 3.1) Embassy Prompt
-# =========================
-EMBASSY_PROMPT_TEMPLATE = """
-You are ONLY responsible for writing natural sentences.
-
-STRICT RULES:
-- You MUST copy EmbassyName, City, Address, and Phone EXACTLY as given.
-- You MUST NOT translate, rephrase, or modify any names, addresses, or phone numbers.
-- You MUST NOT use Markdown, lists, labels, or formatting.
-- Output plain text only.
-- You MUST mention ONLY ONE embassy.
-- You MUST NOT mention any other embassy or country.
-
-
-LANGUAGE OVERRIDE (ABSOLUTE):
-- The answer language is already decided.
-- DO NOT decide the language yourself.
-- Write ONLY in the language specified below.
-
-Answer language: {language}
-
-Your job:
-- Write 2–3 short, clear sentences for a traveler who lost a passport.
-- Use the provided values exactly as they appear.
-
-[Context]:
-{context}
-
-[Answer]:
-""".strip()
-
-embassy_prompt = ChatPromptTemplate.from_template(EMBASSY_PROMPT_TEMPLATE)
-
-
-# =========================
-# 3.2) Hospital Prompt
-# =========================
 HOSPITAL_PROMPT_TEMPLATE = """
-You are ONLY responsible for writing natural sentences.
+You are helping a traveler who may need medical assistance in Tajikistan.
+
+Use ONLY the information provided in [Context].
+If hospital names, addresses, or phone numbers are present, present them clearly.
+Do NOT provide medical diagnosis or treatment advice.
+Do NOT mention documents or sources.
+
+Language rules (STRICT):
+- If the question is in Russian, answer in Russian.
+- Otherwise, answer in English.
+- Do not use any other language.
+
+Output style:
+- Prefer 2–4 short sentences.
+- If multiple hospitals appear, list up to 2 hospitals with:
+  name, city, address, phone (if available).
+- If phone is N/A, say it is not available.
+
+[Context]:
+{context}
+
+[Question]:
+{question}
+
+[Answer]:
+""".strip()
+
+
+EMBASSY_PROMPT_TEMPLATE = """
+You are a traveler assistance bot.
+
+CRITICAL OUTPUT RULE:
+- You MUST answer ONLY in {answer_language}.
+- Do NOT use any other language.
+- Even if the context is written in a different language, translate it into {answer_language}.
 
 STRICT RULES:
-- You MUST copy hospital name, city, address, and phone EXACTLY as given.
-- You MUST NOT translate, rephrase, or modify any names, addresses, or phone numbers.
-- You MUST NOT add hospitals or remove hospitals.
-- You MUST NOT merge information from different hospitals.
-- You MUST NOT use Markdown, lists, bullets, or labels.
-- Output plain text only.
-
-FORMAT RULES (VERY IMPORTANT):
-- Each hospital MUST be written as a separate paragraph.
-- Insert a blank line between hospitals.
-- Each paragraph MUST mention only ONE hospital.
-
-LANGUAGE OVERRIDE:
-- The answer language is already decided.
-- Write ONLY in the language specified below.
-
-Answer language: {language}
-
-Your job:
-- For EACH hospital block, write exactly 2 short sentences:
-  1) where the hospital is located
-  2) how to contact it (phone)
+- Use ONLY the information in [Context].
+- Mention ONLY ONE embassy.
+- Include the embassy name, city, address, and phone number.
+- Do NOT add or guess information.
+- Plain text only.
 
 [Context]:
 {context}
@@ -189,16 +155,57 @@ Your job:
 [Answer]:
 """.strip()
 
-hospital_prompt = ChatPromptTemplate.from_template(HOSPITAL_PROMPT_TEMPLATE)
+
+
+
+travel_prompt = ChatPromptTemplate.from_template(TRAVEL_PROMPT_TEMPLATE)
+hospital_prompt = hospital_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "STRICT RULES (violation = incorrect answer):\n"
+     "- Answer ONLY in {answer_language}.\n"
+     "- If Russian, use Cyrillic letters only.\n"
+     "- Output MUST be plain text.\n"
+     "- DO NOT use lists, bullets, asterisks, or markdown.\n"
+     "- Mention NO MORE THAN TWO hospitals.\n"
+     "- Use ONLY the context.\n"
+     "- Include: name, city, address, phone (if available).\n"
+     "- Do NOT add introductions like 'there are several hospitals'.\n"
+     "- Do NOT mention documents, files, or sources.\n"
+    ),
+    ("human",
+     "[Context]\n{context}\n\n"
+     "[Question]\n{question}\n\n"
+     "Answer following the rules exactly.\n"
+     "[Answer]\n")
+])
+
+embassy_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "You MUST follow these rules:\n"
+     "- Answer ONLY in {answer_language}.\n"
+     "- If Russian, use Cyrillic letters.\n"
+     "- Plain text only. NO markdown, NO bullets.\n"
+     "- Use ONLY the context.\n"
+     "- Mention ONLY ONE embassy.\n"
+     "- Include name, city, address, phone.\n"
+    ),
+    ("human",
+     "[Context]\n{context}\n\n"
+     "[Question]\n{question}\n\n"
+     "[Answer]\n")
+])
 
 
 # =========================
 # 4) LLM / Embedding (Ollama)
 # =========================
-llm = ChatOllama(model="gemma2:2b", temperature=0.2)
+llm = ChatOllama(
+    model="gemma2:2b",
+    temperature=0.2,
+    num_predict=220,
+    timeout=25,
+)
 embedding_model = OllamaEmbeddings(model="snowflake-arctic-embed2")
-
-translator_llm = ChatOllama(model="gemma2:2b", temperature=0.0)
 
 
 # =========================
@@ -221,14 +228,8 @@ class SourceInfo(BaseModel):
     snippet: str
 
 
-class ChatMessage(BaseModel):
-    role: str
-    content: str
-
-
 class ChatRequest(BaseModel):
     question: str
-    history: Optional[List[ChatMessage]] = None
 
 
 class ChatResponse(BaseModel):
@@ -240,70 +241,31 @@ class ChatResponse(BaseModel):
 # =========================
 # 7) Utils
 # =========================
+def split_record_txt(text: str, source: str) -> List[Document]:
+    records = []
+    pattern = r"=== (HOSPITAL|EMBASSY)_RECORD_START ===(.*?)=== \1_RECORD_END ==="
+    matches = re.findall(pattern, text, flags=re.DOTALL)
+
+    for i, (rtype, body) in enumerate(matches):
+        meta = {
+            "source": source,
+            "record_type": rtype.lower(),  # hospital | embassy
+            "chunk_index": i,
+        }
+        records.append(
+            Document(
+                page_content=preprocess_text(body),
+                metadata=meta,
+            )
+        )
+    return records
+
 def preprocess_text(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
+    return re.sub(r"\s+", " ", (text or "")).strip()
 
 
 def is_russian(text: str) -> bool:
     return any("\u0400" <= c <= "\u04FF" for c in (text or ""))
-
-
-def is_russian_with_history(text: str, history: Optional[List[ChatMessage]]) -> bool:
-    combined = text or ""
-    if history:
-        for m in history:
-            combined += " " + (m.content or "")
-    return any("\u0400" <= c <= "\u04FF" for c in combined)
-
-
-def translate_answer_if_needed(answer: str, question: str) -> str:
-    if not is_russian(question):
-        return answer
-
-    prompt_txt = f"""
-Translate the following text into Russian.
-
-Rules:
-- Preserve ALL factual details exactly.
-- Do NOT add new information.
-- Do NOT remove information.
-- Output ONLY Russian.
-
-TEXT:
-{answer}
-
-RUSSIAN:
-""".strip()
-
-    try:
-        return translator_llm.invoke(prompt_txt).content.strip()
-    except Exception:
-        return answer
-
-
-def translate_context_if_needed(context: str, question: str) -> str:
-    if not is_russian(question):
-        return context
-
-    translate_prompt = f"""
-Translate the following text into Russian.
-
-Rules:
-- Preserve ALL factual details exactly (addresses, phone numbers, names).
-- Do NOT summarize.
-- Do NOT omit any information.
-- Keep formatting readable.
-
-TEXT:
-{context}
-
-RUSSIAN:
-""".strip()
-
-    try:
-        return translator_llm.invoke(translate_prompt).content
-    except Exception:
-        return context
 
 
 def sanitize_metadata(meta: dict) -> dict:
@@ -331,7 +293,7 @@ def split_semantic_then_fallback(docs: List[Document]) -> List[Document]:
 
 
 def build_context(docs: List[Document], max_chars: int = MAX_CONTEXT_CHARS) -> str:
-    parts = []
+    parts: List[str] = []
     total = 0
     for d in docs:
         text = (d.page_content or "").strip()
@@ -347,30 +309,6 @@ def build_context(docs: List[Document], max_chars: int = MAX_CONTEXT_CHARS) -> s
     return "\n\n---\n\n".join(parts)
 
 
-def build_history(history: Optional[List[ChatMessage]]) -> str:
-    if not history:
-        return ""
-
-    recent = history[-MAX_HISTORY_TURNS:]
-    lines: List[str] = []
-    for m in recent:
-        role = (m.role or "").strip().lower()
-        content = (m.content or "").strip()
-        if not content:
-            continue
-        if role == "user":
-            lines.append(f"User: {content}")
-        elif role == "assistant":
-            lines.append(f"Assistant: {content}")
-        else:
-            lines.append(f"{role.capitalize() if role else 'Message'}: {content}")
-
-    text = "\n".join(lines).strip()
-    if len(text) <= MAX_HISTORY_CHARS:
-        return text
-    return text[-MAX_HISTORY_CHARS:]
-
-
 def doc_key(d: Document) -> str:
     m = d.metadata or {}
     if "doc_id" in m and "chunk_index" in m and "source" in m:
@@ -381,10 +319,10 @@ def doc_key(d: Document) -> str:
 def rrf_merge(
     dense_docs: List[Document],
     sparse_docs: List[Document],
-    k_final: int = K_FINAL,
-    rrf_k: int = RRF_K,
-    dense_weight: float = 0.3,
-    sparse_weight: float = 0.7,
+    k_final: int,
+    rrf_k: int,
+    dense_weight: float,
+    sparse_weight: float,
 ) -> List[Document]:
     scores: Dict[str, float] = {}
     by_key: Dict[str, Document] = {}
@@ -395,8 +333,8 @@ def rrf_merge(
             by_key[key] = d
             scores[key] = scores.get(key, 0.0) + weight * (1.0 / (rrf_k + rank))
 
-    add(dense_docs, weight=dense_weight)
-    add(sparse_docs, weight=sparse_weight)
+    add(dense_docs, dense_weight)
+    add(sparse_docs, sparse_weight)
 
     merged = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     return [by_key[k] for k, _ in merged[:k_final]]
@@ -426,23 +364,26 @@ def cosine(a: List[float], b: List[float]) -> float:
 
 
 def rerank_by_embedding(query: str, docs: List[Document], top_k: int) -> List[Document]:
+    if not docs:
+        return []
     q = embedding_model.embed_query(query)
-    doc_vecs = embedding_model.embed_documents([d.page_content for d in docs])
+    doc_vecs = embedding_model.embed_documents([(d.page_content or "") for d in docs])
     scored = [(cosine(q, v), d) for v, d in zip(doc_vecs, docs)]
     scored.sort(key=lambda x: x[0], reverse=True)
     return [d for _, d in scored[:top_k]]
 
 
 def is_fact_question(q: str) -> bool:
-    ql = (q or "").lower()
+    q = q or ""
+    ql = q.lower()
 
-    if any(ch.isdigit() for ch in (q or "")):
+    if any(ch.isdigit() for ch in q):
         return True
 
     patterns = [
         r"\bhow many\b",
         r"\bhow high\b",
-        r"\bwhat(?:'s| is) the name\b",
+        r"\bwhat(?:'s| is)\b",
         r"\bwhich\b",
         r"\bwhere\b",
         r"\blocated\b",
@@ -457,482 +398,35 @@ def is_fact_question(q: str) -> bool:
     return any(re.search(p, ql) for p in patterns)
 
 
-# =========================
-# Embassy / Hospital intent
-# =========================
-def is_passport_or_embassy_topic(q: str) -> bool:
-    ql = (q or "").lower()
-    keywords = ["passport", "visa", "embassy", "consulate", "lost passport", "stolen passport"]
-    return any(k in ql for k in keywords)
+def select_prompt(question: str, docs: List[Document]):
+    ql = (question or "").lower()
+    types = { (d.metadata or {}).get("record_type") for d in docs }
 
+    has_hospital = "hospital" in types
+    has_embassy = "embassy" in types
 
-def needs_embassy_help(q: str) -> bool:
-    ql = (q or "").lower()
-    keywords = [
-        "lost passport",
-        "lost my passport",
-        "passport lost",
-        "stolen passport",
-        "passport stolen",
-        "my passport was stolen",
-        "i lost my passport",
-        "i have lost my passport",
-        "i lost passport",
-        "embassy",
-        "consulate",
-        "emergency",
-        "urgent",
-        "robbed",
-        "theft",
-        "stolen",
-        "visa problem",
-        "need help",
-        "lost documents",
-        "lost my id",
-    ]
-    if any(k in ql for k in keywords):
-        return True
+    q_hospital_hint = any(k in ql for k in ["hospital", "clinic", "doctor", "medical", "sick", "fever", "injury"])
+    q_embassy_hint = any(k in ql for k in ["passport", "visa", "embassy", "consulate", "stolen", "lost passport"])
 
-    ru_keywords = [
-        "потерял паспорт",
-        "потеряла паспорт",
-        "украли паспорт",
-        "посольство",
-        "консульство",
-        "срочно",
-        "экстренно",
-    ]
-    if any(k in ql for k in ru_keywords):
-        return True
+    if has_hospital and q_hospital_hint:
+        return hospital_prompt
+    if has_embassy and q_embassy_hint:
+        return embassy_prompt
+    if has_hospital and not has_embassy:
+        return hospital_prompt
+    if has_embassy and not has_hospital:
+        return embassy_prompt
 
-    return False
-
-
-def needs_hospital_help(q: str) -> bool:
-    ql = (q or "").lower()
-    keywords = [
-        "hospital",
-        "clinic",
-        "doctor",
-        "medical",
-        "i am sick",
-        "i'm sick",
-        "i feel sick",
-        "i am ill",
-        "i'm ill",
-        "fever",
-        "pain",
-        "injury",
-        "injured",
-        "need a doctor",
-        "need hospital",
-        "where is a hospital",
-        "where can i see a doctor",
-        "emergency room",
-        "er",
-    ]
-    if any(k in ql for k in keywords):
-        return True
-
-    ru_keywords = [
-        "больница",
-        "клиника",
-        "врач",
-        "мне плохо",
-        "я болен",
-        "температура",
-        "боль",
-        "травма",
-        "скорая",
-    ]
-    if any(k in ql for k in ru_keywords):
-        return True
-
-    return False
+    return travel_prompt
 
 
 # =========================
-# Hospital city parsing / normalization
-# =========================
-CITY_ALIAS = {
-    "dushanbe": "dushanbe",
-    "душанбе": "dushanbe",
-    "khujand": "khujand",
-    "худжанд": "khujand",
-    "bokhtar": "bokhtar",
-    "бохтар": "bokhtar",
-    "kulob": "kulob",
-    "куляб": "kulob",
-    "khorog": "khorog",
-    "хорог": "khorog",
-    "panjakent": "panjakent",
-    "пенджикент": "panjakent",
-}
-
-
-def normalize_city(text: str) -> str:
-    t = (text or "").lower()
-    t = re.sub(r"[^a-z\u0400-\u04FF ]", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-
-def canonical_city(text: str) -> str:
-    n = normalize_city(text)
-    return CITY_ALIAS.get(n, n)
-
-
-def extract_city(text: str) -> Optional[str]:
-    if not text:
-        return None
-    t = text.strip()
-
-    patterns = [
-        r"\bI am in\s+([A-Za-z][A-Za-z \-]{1,40})\b",
-        r"\bI'm in\s+([A-Za-z][A-Za-z \-]{1,40})\b",
-        r"\bI’m in\s+([A-Za-z][A-Za-z \-]{1,40})\b",
-        r"\bin\s+([A-Za-z][A-Za-z \-]{1,40})\b",
-        r"\bat\s+([A-Za-z][A-Za-z \-]{1,40})\b",
-        r"\bcity:\s*([A-Za-z][A-Za-z \-]{1,40})\b",
-    ]
-    for p in patterns:
-        m = re.search(p, t, flags=re.IGNORECASE)
-        if m:
-            cand = m.group(1).strip(" .,!?:;\"'")
-            if cand:
-                return cand
-    return None
-
-
-def was_city_requested(history: Optional[List[ChatMessage]]) -> bool:
-    if not history:
-        return False
-    recent = history[-MAX_HISTORY_TURNS:]
-    for m in reversed(recent):
-        if (m.role or "").strip().lower() != "assistant":
-            continue
-        c = (m.content or "").lower()
-        if "which city" in c or "what city" in c or "city are you in" in c or "currently in" in c:
-            return True
-        if "в каком городе" in c:
-            return True
-        break
-    return False
-
-
-def find_city_from_history(history: Optional[List[ChatMessage]]) -> Optional[str]:
-    if not history:
-        return None
-    recent = history[-MAX_HISTORY_TURNS:]
-    for m in reversed(recent):
-        if (m.role or "").strip().lower() != "user":
-            continue
-        city = extract_city(m.content or "")
-        if city:
-            return city
-    return None
-
-
-def extract_city_fallback_if_awaiting(history: Optional[List[ChatMessage]], text: str) -> Optional[str]:
-    if not text:
-        return None
-    if not was_city_requested(history):
-        return None
-
-    t = text.strip()
-    if len(t) > 40:
-        return None
-    if any(ch.isdigit() for ch in t):
-        return None
-    if not re.fullmatch(r"[A-Za-z\u0400-\u04FF \-]+", t):
-        return None
-    return t.strip(" -")
-
-
-def parse_hospital_record(text: str) -> Dict[str, str]:
-    """
-    One-line record expected:
-    Type: Hospital City: ... Name: ... Address: ... Phone: ...
-    """
-    t = (text or "").strip()
-    out: Dict[str, str] = {}
-
-    def pick_between(start_key: str, end_key: Optional[str]) -> Optional[str]:
-        if end_key:
-            m = re.search(
-                rf"{re.escape(start_key)}\s*:\s*(.*?)\s*(?={re.escape(end_key)}\s*:)",
-                t,
-                flags=re.IGNORECASE,
-            )
-        else:
-            m = re.search(rf"{re.escape(start_key)}\s*:\s*(.*)", t, flags=re.IGNORECASE)
-        return m.group(1).strip() if m else None
-
-    typ = pick_between("Type", "City")
-    city = pick_between("City", "Name")
-    name = pick_between("Name", "Address")
-    address = pick_between("Address", "Phone")
-    phone = pick_between("Phone", None)
-
-    if typ:
-        out["Type"] = typ
-    if city:
-        out["City"] = city
-    if name:
-        out["Name"] = name
-        out["HospitalName"] = name
-    if address:
-        out["Address"] = address
-    if phone:
-        out["Phone"] = phone
-
-    return out
-
-
-def normalize_hospital_key(name: str) -> str:
-    if not name:
-        return ""
-    t = name.lower()
-    t = re.sub(r"\(.*?\)", "", t)
-    t = re.sub(r"[^a-z0-9 ]", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-
-# =========================
-# Embassy nationality parsing / matching
-# =========================
-def normalize_nationality(nat: str) -> str:
-    n = (nat or "").strip().lower()
-
-    mapping = {
-        # US
-        "usa": "united states",
-        "us": "united states",
-        "u.s.": "united states",
-        "u.s.a.": "united states",
-        "united states": "united states",
-        "united states of america": "united states",
-        "america": "united states",
-        "american": "united states",
-        "сша": "united states",
-        "соединенные штаты": "united states",
-        "соединённые штаты": "united states",
-
-        # Korea
-        "korea": "republic of korea",
-        "south korea": "republic of korea",
-        "republic of korea": "republic of korea",
-        "rok": "republic of korea",
-        "korean": "republic of korea",
-        "южная корея": "republic of korea",
-        "корея": "republic of korea",
-
-        # Russia
-        "russia": "russian federation",
-        "russian": "russian federation",
-        "russian federation": "russian federation",
-        "rf": "russian federation",
-        "россия": "russian federation",
-        "российская федерация": "russian federation",
-
-        # Germany
-        "germany": "germany",
-        "german": "germany",
-        "deutschland": "germany",
-        "германия": "germany",
-    }
-
-    return mapping.get(n, n)
-
-
-def extract_nationality(text: str) -> Optional[str]:
-    if not text:
-        return None
-    t = text.strip()
-
-    patterns = [
-        r"\bI am\s+([A-Za-z][A-Za-z \-]{1,40})\b",
-        r"\bI'm\s+([A-Za-z][A-Za-z \-]{1,40})\b",
-        r"\bI’m\s+([A-Za-z][A-Za-z \-]{1,40})\b",
-        r"\bmy nationality is\s+([A-Za-z][A-Za-z \-]{1,40})\b",
-        r"\bmy country is\s+([A-Za-z][A-Za-z \-]{1,40})\b",
-        r"\bnationality:\s*([A-Za-z][A-Za-z \-]{1,40})\b",
-        r"\bcitizen of\s+([A-Za-z][A-Za-z \-]{1,40})\b",
-    ]
-
-    for p in patterns:
-        m = re.search(p, t, flags=re.IGNORECASE)
-        if m:
-            cand = m.group(1).strip(" .,!?:;\"'")
-            if cand:
-                return cand
-    return None
-
-
-def was_nationality_requested(history: Optional[List[ChatMessage]]) -> bool:
-    if not history:
-        return False
-    recent = history[-MAX_HISTORY_TURNS:]
-    for m in reversed(recent):
-        if (m.role or "").strip().lower() != "assistant":
-            continue
-        c = (m.content or "").lower()
-        if "nationality" in c or "what is your nationality" in c or "tell me your nationality" in c:
-            return True
-        if "гражданство" in c or "какое у вас гражданство" in c:
-            return True
-        break
-    return False
-
-
-def find_nationality_from_history(history: Optional[List[ChatMessage]]) -> Optional[str]:
-    if not history:
-        return None
-    recent = history[-MAX_HISTORY_TURNS:]
-    for m in reversed(recent):
-        if (m.role or "").strip().lower() != "user":
-            continue
-        nat = extract_nationality(m.content or "")
-        if nat:
-            return nat
-    return None
-
-
-def embassy_matches_country(doc: Document, nat_l: str) -> bool:
-    txt = doc.page_content or ""
-
-    m = re.search(r"Country\s*:\s*([^\n\r]+)", txt, flags=re.IGNORECASE)
-    if m:
-        country = m.group(1).strip().lower()
-        if country == nat_l:
-            return True
-
-    m = re.search(r"CountryAlias\s*:\s*([^\n\r]+)", txt, flags=re.IGNORECASE)
-    if m:
-        aliases = [a.strip().lower() for a in m.group(1).split(",")]
-        if nat_l in aliases:
-            return True
-
-    return False
-
-
-def parse_embassy_record(text: str) -> Dict[str, str]:
-    t = text or ""
-    out: Dict[str, str] = {}
-
-    def pick(key: str) -> Optional[str]:
-        m = re.search(rf"{re.escape(key)}\s*:\s*([^\n\r]+)", t, flags=re.IGNORECASE)
-        return m.group(1).strip() if m else None
-
-    for k in ["EmbassyName", "City", "MapLocation", "Phone"]:
-        v = pick(k)
-        if v:
-            out[k] = v
-    return out
-
-
-# =========================
-# RU hard maps (optional, as in your code)
-# =========================
-EMBASSY_RU = {
-    "united states": {
-        "name": "Посольство Соединённых Штатов Америки в Таджикистане",
-        "city": "Душанбе",
-        "address": "Республика Таджикистан, г. Душанбе, проспект Исмоили Сомони, дом 109А",
-        "phone": "+992 37 229 2000",
-    },
-    "russian federation": {
-        "name": "Посольство Российской Федерации в Таджикистане",
-        "city": "Душанбе",
-        "address": "Республика Таджикистан, г. Душанбе, ул. Абу Али ибн Сино, дом 29/31",
-        "phone": "+992 37 235 9827",
-    },
-    "republic of korea": {
-        "name": "Посольство Республики Корея в Таджикистане",
-        "city": "Душанбе",
-        "address": "Республика Таджикистан, г. Душанбе, ул. Льва Толстого, дом 9",
-        "phone": "+992 37 229 3001",
-    },
-}
-
-HOSPITAL_RU_MAP = {
-    "shifobakhsh national medical center": {
-        "name": "Национальный медицинский центр «Шифобахш»",
-        "city": "Душанбе",
-        "address": "Республика Таджикистан, г. Душанбе, ул. Ибн Сино, 59",
-    },
-    "istiqlol medical complex": {
-        "name": "Медицинский комплекс «Истиклол»",
-        "city": "Душанбе",
-        "address": "Республика Таджикистан, г. Душанбе, проспект Немата Карабаева, 61",
-    },
-    "republican clinical cardiology center": {
-        "name": "Республиканский клинический кардиологический центр",
-        "city": "Душанбе",
-        "address": "Республика Таджикистан, г. Душанбе, проспект Ибн Сино, 59",
-    },
-    "children s hospital of infectious diseases": {
-        "name": "Детская инфекционная больница",
-        "city": "Душанбе",
-        "address": "Республика Таджикистан, г. Душанбе, ул. Шероз, 20",
-    },
-    "dushanbe city clinical hospital no 1": {
-        "name": "Городская клиническая больница №1 города Душанбе",
-        "city": "Душанбе",
-        "address": "Республика Таджикистан, г. Душанбе",
-    },
-    "dushanbe city clinical hospital no 3": {
-        "name": "Городская клиническая больница №3 города Душанбе",
-        "city": "Душанбе",
-        "address": "Республика Таджикистан, г. Душанбе",
-    },
-    "sughd regional clinical hospital": {
-        "name": "Согдийская областная клиническая больница",
-        "city": "Худжанд",
-        "address": "Республика Таджикистан, г. Худжанд, ул. Рахмона Набиева, 111",
-    },
-    "khujand city hospital": {
-        "name": "Городская больница города Худжанд",
-        "city": "Худжанд",
-        "address": "Республика Таджикистан, г. Худжанд",
-    },
-    "aga khan medical centre khorog": {
-        "name": "Медицинский центр Ага Хана в Хороге",
-        "city": "Хорог",
-        "address": "Республика Таджикистан, г. Хорог, ул. Шогуниева, 1",
-    },
-    "khorog central regional hospital": {
-        "name": "Центральная региональная больница города Хорог",
-        "city": "Хорог",
-        "address": "Республика Таджикистан, г. Хорог",
-    },
-    "bokhtar city hospital": {
-        "name": "Городская больница города Бохтар",
-        "city": "Бохтар",
-        "address": "Республика Таджикистан, г. Бохтар",
-    },
-    "kulob city hospital": {
-        "name": "Городская больница города Куляб",
-        "city": "Куляб",
-        "address": "Республика Таджикистан, г. Куляб",
-    },
-    "panjakent city hospital": {
-        "name": "Городская больница города Пенджикент",
-        "city": "Пенджикент",
-        "address": "Республика Таджикистан, г. Пенджикент",
-    },
-}
-
-
-# =========================
-# 8) FastAPI Lifespan (캐시/락 준비)
+# 8) FastAPI Lifespan
 # =========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     os.makedirs(DB_DIR, exist_ok=True)
-    os.makedirs(STATIC_DIR, exist_ok=True)
 
     app.state.vectordb = get_vectorstore()
     app.state.bm25 = None
@@ -949,25 +443,17 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Tajikistan RAG API (Ollama Embeddings + Gemma2)",
+    title="Tajikistan RAG API (Retrieval-first Prompt Selection)",
     lifespan=lifespan,
 )
 
-
-# =========================
-# Frontend (Static)
-# =========================
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
 
 @app.get("/")
 async def serve_index():
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
 
 
-# =========================
-# 9) Ingest API
-# =========================
 @app.post("/ingest")
 async def ingest_document(file: UploadFile = File(...)):
     doc_id = str(uuid.uuid4())
@@ -977,25 +463,43 @@ async def ingest_document(file: UploadFile = File(...)):
         with open(save_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
 
-        filename_lower = file.filename.lower()
+        filename_lower = (file.filename or "").lower()
+
+        # ======================
+        # 1️⃣ PDF
+        # ======================
         if filename_lower.endswith(".pdf"):
             loader = PyMuPDFLoader(save_path)
+            docs = loader.load()
+
+            for d in docs:
+                d.page_content = preprocess_text(d.page_content)
+
+            chunks = split_semantic_then_fallback(docs)
+
+        # ======================
+        # 2️⃣ TXT
+        # ======================
         elif filename_lower.endswith(".txt"):
-            loader = TextLoader(save_path, encoding="utf-8")
+            raw_text = TextLoader(save_path, encoding="utf-8").load()[0].page_content
+            raw_text = preprocess_text(raw_text)
+
+            # ✅ record 기반 txt
+            if "HOSPITAL_RECORD_START" in raw_text or "EMBASSY_RECORD_START" in raw_text:
+                chunks = split_record_txt(raw_text, file.filename)
+            else:
+                docs = [Document(page_content=raw_text, metadata={"source": file.filename})]
+                chunks = split_semantic_then_fallback(docs)
+
         else:
             raise HTTPException(status_code=400, detail="Only pdf or txt supported")
 
-        docs = loader.load()
-        if not docs:
-            raise HTTPException(status_code=400, detail="No content extracted from file")
-
-        for d in docs:
-            d.page_content = preprocess_text(d.page_content)
-
-        chunks = split_semantic_then_fallback(docs)
         if not chunks:
             raise HTTPException(status_code=400, detail="Chunking produced no chunks")
 
+        # ======================
+        # 3️⃣ metadata 공통 처리
+        # ======================
         for i, d in enumerate(chunks):
             d.metadata = d.metadata or {}
             d.metadata.update(
@@ -1005,15 +509,6 @@ async def ingest_document(file: UploadFile = File(...)):
                     "chunk_index": i,
                 }
             )
-
-            page = d.metadata.get("page")
-            if page is None:
-                d.metadata.pop("page", None)
-            else:
-                try:
-                    d.metadata["page"] = int(page)
-                except Exception:
-                    d.metadata.pop("page", None)
 
         chunks = filter_complex_metadata(chunks)
         for d in chunks:
@@ -1029,7 +524,7 @@ async def ingest_document(file: UploadFile = File(...)):
 
 
 # =========================
-# 10) Chat API (Hybrid RAG + Hospital + Embassy + Travel)
+# 10) Chat API (Hybrid RAG + Prompt Selection)
 # =========================
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
@@ -1037,290 +532,18 @@ async def chat(req: ChatRequest):
     vectordb: Chroma = app.state.vectordb
     bm25: Optional[BM25Retriever] = app.state.bm25
 
-    history_text = build_history(req.history)
-
-    # =========================
-    # Hospital flow
-    # =========================
-    hospital_intent = (
-        (not is_passport_or_embassy_topic(req.question))
-        and (needs_hospital_help(req.question) or was_city_requested(req.history))
-    )
-
-    if hospital_intent:
-        city = (
-            extract_city(req.question)
-            or find_city_from_history(req.history)
-            or extract_city_fallback_if_awaiting(req.history, req.question)
+    q = (req.question or "").strip()
+    if not q:
+        return ChatResponse(
+            answer="Please ask a question.",
+            time_taken=time.time() - start,
+            sources=[]
         )
 
-        if city is None:
-            answer = (
-                "Понимаю. Чтобы подсказать больницу, скажите, пожалуйста, в каком городе вы находитесь "
-                "(например: Душанбе, Худжанд, Бохтар)."
-                if is_russian_with_history(req.question, req.history)
-                else
-                "I understand. To suggest a hospital, which city are you currently in "
-                "(e.g., Dushanbe, Khujand, Bokhtar)?"
-            )
-            return ChatResponse(answer=answer, time_taken=time.time() - start, sources=[])
+    # ✅ 출력 언어를 코드 레벨에서 강제
+    answer_language = "Russian" if is_russian(q) else "English"
 
-        city_norm = canonical_city(city)
-
-        search_query = f"Type: Hospital City: {city} phone address"
-
-        dense_docs = vectordb.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": K_DENSE},
-        ).invoke(search_query)
-
-        sparse_docs = bm25.invoke(search_query) if bm25 else []
-
-        merged_docs = rrf_merge(
-            dense_docs,
-            sparse_docs,
-            k_final=50,
-            rrf_k=RRF_K,
-            dense_weight=0.3,
-            sparse_weight=0.7,
-        )
-
-        def extract_hospital_records_from_chunk(text: str) -> List[str]:
-            if not text:
-                return []
-            pattern = r"Type:\s*Hospital\s+City:\s*.*?(?=(?:Type:\s*Hospital\s+City:)|$)"
-            matches = re.findall(pattern, text, flags=re.IGNORECASE | re.DOTALL)
-            return [re.sub(r"\s+", " ", m).strip() for m in matches if m.strip()]
-
-        unique_hospitals: Dict[str, Dict[str, str]] = {}
-        used_docs: List[Document] = []
-
-        for d in merged_docs:
-            records = extract_hospital_records_from_chunk(d.page_content)
-            for rec in records:
-                fields = parse_hospital_record(rec)
-
-                doc_city_norm = canonical_city(fields.get("City", ""))
-                if doc_city_norm != city_norm:
-                    continue
-
-                name = (fields.get("HospitalName") or fields.get("Name") or "").strip()
-                if not name:
-                    continue
-
-                unique_hospitals[name.lower()] = fields
-                used_docs.append(d)
-
-        if not unique_hospitals:
-            answer = (
-                f"У меня нет информации о больницах в городе {city}."
-                if is_russian_with_history(req.question, req.history)
-                else f"I don’t have hospital information for {city}."
-            )
-            return ChatResponse(answer=answer, time_taken=time.time() - start, sources=[])
-
-        hospital_blocks: List[str] = []
-        is_ru = is_russian_with_history(req.question, req.history)
-
-        for key in sorted(unique_hospitals.keys()):
-            f = unique_hospitals[key]
-            name_en = f.get("HospitalName", "N/A")
-            address_en = f.get("Address", "N/A")
-            phone = f.get("Phone", "N/A")
-
-            if is_ru:
-                key_norm = normalize_hospital_key(name_en)
-                ru = HOSPITAL_RU_MAP.get(key_norm)
-
-                if not ru:
-                    for k_norm, v in HOSPITAL_RU_MAP.items():
-                        if k_norm and (k_norm in key_norm or key_norm in k_norm):
-                            ru = v
-                            break
-
-                if not ru:
-                    continue
-
-                name = ru["name"]
-                address = ru["address"]
-                city_out = ru["city"]
-            else:
-                name = name_en
-                address = address_en
-                city_out = city
-
-            hospital_blocks.append(
-                f"HospitalName: {name}\nCity: {city_out}\nAddress: {address}\nPhone: {phone}".strip()
-            )
-
-        if is_ru and not hospital_blocks:
-            answer = f"У меня нет подтверждённых данных о больницах в городе {city} на русском языке."
-            return ChatResponse(answer=answer, time_taken=time.time() - start, sources=[])
-
-        context_for_llm = "\n\n".join(hospital_blocks)
-
-        chain = hospital_prompt | llm | StrOutputParser()
-        language = "Russian" if is_ru else "English"
-
-        answer_raw = chain.invoke({"context": context_for_llm, "language": language})
-        final_answer = (answer_raw or "").strip()
-
-        unique_docs: Dict[str, Document] = {}
-        for d in used_docs:
-            unique_docs[doc_key(d)] = d
-
-        sources = [
-            SourceInfo(
-                file=(d.metadata or {}).get("source", "unknown"),
-                page=(d.metadata or {}).get("page"),
-                snippet=d.page_content,
-            )
-            for d in unique_docs.values()
-        ]
-
-        return ChatResponse(answer=final_answer, time_taken=time.time() - start, sources=sources)
-
-    # =========================
-    # Embassy flow  (핵심: doc 1개만 뽑고, Context도 1개만)
-    # =========================
-    embassy_intent = needs_embassy_help(req.question) or was_nationality_requested(req.history)
-
-    if is_russian_with_history(req.question, req.history):
-        if "паспорт" in (req.question or "").lower():
-            embassy_intent = True
-
-    if embassy_intent:
-        nat_in_question = extract_nationality(req.question)
-        nat_in_history = find_nationality_from_history(req.history)
-        nationality = nat_in_question or nat_in_history
-
-        if nationality is None and was_nationality_requested(req.history):
-            t = (req.question or "").strip()
-            if 1 <= len(t) <= 40:
-                nationality = t
-
-        if nationality is None:
-            answer = (
-                "Понимаю — это срочная ситуация.\n"
-                "Чтобы подсказать правильное посольство в Таджикистане, "
-                "скажите, пожалуйста, ваше гражданство "
-                "(например: США, Южная Корея, Германия)."
-                if is_russian_with_history(req.question, req.history)
-                else
-                "I’m sorry you’re dealing with this.\n"
-                "To point you to the correct embassy in Tajikistan, "
-                "what is your nationality (e.g., USA, Korea, Germany)?"
-            )
-            return ChatResponse(answer=answer, time_taken=time.time() - start, sources=[])
-
-        nat_l = normalize_nationality(nationality)
-
-        search_query = f"embassy {nat_l} Tajikistan Dushanbe phone address"
-
-        dense_docs = vectordb.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": K_DENSE},
-        ).invoke(search_query)
-
-        sparse_docs = []
-        if bm25 is not None:
-            bm25.k = K_SPARSE
-            sparse_docs = bm25.invoke(search_query)
-
-        final_candidates = rrf_merge(
-            dense_docs,
-            sparse_docs,
-            k_final=10,
-            rrf_k=RRF_K,
-            dense_weight=0.3,
-            sparse_weight=0.7,
-        )
-
-        embassy_only: List[Document] = []
-        for d in final_candidates:
-            src = ((d.metadata or {}).get("source") or "").lower()
-            txt = (d.page_content or "").lower()
-            if "type: embassy" in txt and "embassy" in src:
-                embassy_only.append(d)
-        if embassy_only:
-            final_candidates = embassy_only
-
-        embassy_candidates = [
-            d for d in final_candidates
-            if "type: embassy" in (d.page_content or "").lower()
-        ]
-
-        matched = [
-            d for d in embassy_candidates
-            if embassy_matches_country(d, nat_l)
-        ]
-
-        # 🔒 여기서 강제 1개 확정
-        matched = matched[:1]
-
-        if not matched:
-            answer = (
-                "У меня нет информации о посольстве этой страны в моих документах."
-                if is_russian_with_history(req.question, req.history)
-                else "I don’t have embassy information for that country in my documents."
-            )
-            return ChatResponse(answer=answer, time_taken=time.time() - start, sources=[])
-
-        # ✅ 여기서 doc 1개 확정
-        doc = matched[0]
-
-        fields = parse_embassy_record(doc.page_content)
-
-        embassy_name_en = fields.get("EmbassyName", "N/A")
-        city_en = fields.get("City", "N/A")
-        address_en = fields.get("MapLocation", "N/A")
-        phone = fields.get("Phone", "N/A")
-
-        if is_russian_with_history(req.question, req.history):
-            ru = EMBASSY_RU.get(nat_l)
-            if not ru:
-                return ChatResponse(
-                    answer="У меня нет подтверждённых данных об этом посольстве на русском языке.",
-                    time_taken=time.time() - start,
-                    sources=[]
-                )
-            embassy_name_final = ru["name"]
-            city_final = ru["city"]
-            address_final = ru["address"]
-            phone = ru["phone"]
-        else:
-            embassy_name_final = embassy_name_en
-            city_final = city_en
-            address_final = address_en
-
-        # ✅ Context도 딱 1개 레코드만
-        context_for_llm = f"""
-EmbassyName: {embassy_name_final}
-City: {city_final}
-Address: {address_final}
-Phone: {phone}
-""".strip()
-
-        chain = embassy_prompt | llm | StrOutputParser()
-        language = "Russian" if is_russian_with_history(req.question, req.history) else "English"
-
-        answer_raw = chain.invoke({"context": context_for_llm, "language": language})
-        final_answer = (answer_raw or "").strip()
-
-        sources = [
-            SourceInfo(
-                file=(doc.metadata or {}).get("source", "unknown"),
-                page=(doc.metadata or {}).get("page"),
-                snippet=doc.page_content,
-            )
-        ]
-
-        return ChatResponse(answer=final_answer, time_taken=time.time() - start, sources=sources)
-
-    # =========================
-    # Travel RAG flow (기존)
-    # =========================
-    fact = is_fact_question(req.question)
+    fact = is_fact_question(q)
 
     if fact:
         dense_search_type = "similarity"
@@ -1336,55 +559,90 @@ Phone: {phone}
     dense_docs = vectordb.as_retriever(
         search_type=dense_search_type,
         search_kwargs=dense_kwargs,
-    ).invoke(req.question)
+    ).invoke(q)
 
     sparse_docs: List[Document] = []
     if bm25 is not None:
         bm25.k = K_SPARSE
-        sparse_docs = bm25.invoke(req.question)
+        sparse_docs = bm25.invoke(q)
 
     final_candidates = rrf_merge(
-        dense_docs,
-        sparse_docs,
+        dense_docs=dense_docs,
+        sparse_docs=sparse_docs,
         k_final=20,
         rrf_k=RRF_K,
         dense_weight=dense_weight,
         sparse_weight=sparse_weight,
     )
 
-    if rerank:
-        final_docs = rerank_by_embedding(req.question, final_candidates, top_k=K_FINAL)
-    else:
-        final_docs = final_candidates[:K_FINAL]
+    final_docs = (
+        rerank_by_embedding(q, final_candidates, top_k=K_FINAL)
+        if rerank
+        else final_candidates[:K_FINAL]
+    )
 
     if not final_docs:
         answer = (
-            "У меня нет информации об этом в моих документах."
-            if is_russian_with_history(req.question, req.history)
-            else "I don't have information about that in my documents."
+            "У меня нет информации об этом."
+            if answer_language == "Russian"
+            else "I don't have information about that."
         )
-        return ChatResponse(answer=answer, time_taken=time.time() - start, sources=[])
+        return ChatResponse(
+            answer=answer,
+            time_taken=time.time() - start,
+            sources=[]
+        )
 
     context = build_context(final_docs, max_chars=MAX_CONTEXT_CHARS)
-    context = translate_context_if_needed(context, req.question)
+
+    # ✅ retrieval 결과(metadata) 기반 prompt 선택
+    chosen_prompt = select_prompt(q, final_docs)
+
+    if chosen_prompt == hospital_prompt:
+        final_docs = [
+            d for d in final_docs
+            if (d.metadata or {}).get("record_type") == "hospital"
+        ]
+
+    # ✅ 언어 강제 변수를 프롬프트에 전달
+    chain = chosen_prompt | llm | StrOutputParser()
+    answer = (
+        chain.invoke({
+            "context": context,
+            "question": q,
+            "answer_language": answer_language,
+        }) or ""
+    ).strip()
+
+    if answer_language == "Russian":
+        answer = (
+            ChatPromptTemplate.from_messages([
+                ("system",
+                "Translate the following text into natural Russian.\n"
+                "Use Cyrillic letters only.\n"
+                "Plain text only. No markdown."
+                ),
+                ("human", "{text}")
+            ])
+            | llm
+            | StrOutputParser()
+        ).invoke({"text": answer}).strip()
+        answer = re.sub(r"^[\*\-\•]\s*", "", answer, flags=re.MULTILINE)
 
     sources = [
         SourceInfo(
             file=(d.metadata or {}).get("source", "unknown"),
             page=(d.metadata or {}).get("page"),
-            snippet=d.page_content,
+            snippet=(d.page_content or "")[:300],
         )
         for d in final_docs
     ]
 
-    chain = prompt | llm | StrOutputParser()
-    lang_hint = "Russian" if is_russian_with_history(req.question, req.history) else "English"
-
-    answer = chain.invoke(
-        {"context": context, "question": f"[Language: {lang_hint}]\n{req.question}", "history": history_text}
+    return ChatResponse(
+        answer=answer,
+        time_taken=time.time() - start,
+        sources=sources,
     )
-    answer = translate_answer_if_needed(answer, req.question)
-    return ChatResponse(answer=answer, time_taken=time.time() - start, sources=sources)
 
 
 # =========================
@@ -1414,7 +672,6 @@ async def delete_document(doc_id: str):
         ids = data.get("ids", [])
         if not ids:
             raise HTTPException(status_code=404, detail="Document not found")
-
         vectordb._collection.delete(ids=ids)
 
     async with app.state.rebuild_lock:
